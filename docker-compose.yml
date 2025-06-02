@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  payment-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    environment:
+      - ETHEREUM_RPC_URL=${ETHEREUM_RPC_URL}
+      - NETWORK_ID=${NETWORK_ID}
+      - CONTRACT_ADDRESS=${CONTRACT_ADDRESS}
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - ETH_USD_PRICE_FEED=${ETH_USD_PRICE_FEED}
+      - FEE_PERCENTAGE=${FEE_PERCENTAGE}
+      - GAS_LIMIT=${GAS_LIMIT}
+      - GAS_PRICE=${GAS_PRICE}
+      # Database connection using the same credentials as your main app
+      - DATABASE_URL=postgres://fahed:junglebook@db:5432/fyp-go
+      - SERVER_PORT=8081
+    ports:
+      - "8081:8081"
+    networks:
+      - fyp-go_default
+
+networks:
+  fyp-go_default:
+    external: true
+    name: fyp-go_default
+
+volumes:
+  postgres_data:
+    name: postgres_data
+    # If you want to use your existing volume, uncomment and set the name
+    # external: true
+    # name: your-existing-volume-name 
