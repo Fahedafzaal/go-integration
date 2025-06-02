@@ -13,12 +13,12 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 
 	"github.com/fahedafzaal/go-integration/internal/config"
+	"github.com/fahedafzaal/go-integration/pkg/blockchain"
 	"github.com/fahedafzaal/go-integration/pkg/database"
-	"github.com/fahedafzaal/go-integration/pkg/payment"
 )
 
 type PaymentGateway struct {
-	client *payment.Client
+	client *blockchain.Client
 	config *config.Config
 	db     *database.DB
 }
@@ -54,7 +54,7 @@ type TransactionResponse struct {
 
 func NewPaymentGateway(cfg *config.Config) (*PaymentGateway, error) {
 	// Initialize blockchain client
-	client, err := payment.NewClient(cfg)
+	client, err := blockchain.NewClient(cfg)
 	if err != nil {
 		return nil, err
 	}

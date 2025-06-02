@@ -1,4 +1,4 @@
-package payment
+package blockchain
 
 import (
 	"math/big"
