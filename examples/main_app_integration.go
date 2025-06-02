@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 
 	"github.com/fahedafzaal/go-integration/pkg/blockchain"
 )
@@ -12,70 +13,235 @@ import (
 // This shows how to use the payment gateway service in your existing handlers
 
 func main() {
-	// Initialize the payment gateway service client
-	paymentGateway := blockchain.NewPaymentGatewayService("http://localhost:8081")
+	fmt.Println("=== Payment Gateway Integration Examples ===")
+	fmt.Println()
 
-	// Example: Call from your RespondToOffer method
-	// This is what you would add to your ApplicationService.RespondToOffer method
-	exampleRespondToOfferIntegration(paymentGateway)
+	// Example 1: HTTP Mode (backward compatibility)
+	fmt.Println("1. HTTP Mode Example:")
+	exampleHTTPMode()
+	fmt.Println()
 
-	// Example: Call from your PosterReviewWork method
-	// This is what you would add to your ApplicationService.PosterReviewWork method
-	examplePosterReviewWorkIntegration(paymentGateway)
+	// Example 2: Direct Blockchain Mode
+	fmt.Println("2. Direct Blockchain Mode Example:")
+	exampleDirectMode()
+	fmt.Println()
+
+	// Example 3: Hybrid Mode (direct + fallback)
+	fmt.Println("3. Hybrid Mode Example:")
+	exampleHybridMode()
+	fmt.Println()
+
+	// Example 4: Integration with your app service
+	fmt.Println("4. Application Service Integration:")
+	exampleAppServiceIntegration()
 }
 
-// Example integration for RespondToOffer (when candidate accepts offer)
+// Example 1: HTTP Mode (existing functionality)
+func exampleHTTPMode() {
+	// Create HTTP-only service (backward compatible)
+	paymentGateway := blockchain.NewPaymentGatewayServiceHTTP("http://localhost:8081")
+	defer paymentGateway.Close()
+
+	exampleRespondToOfferIntegration(paymentGateway)
+}
+
+// Example 2: Direct Blockchain Mode
+func exampleDirectMode() {
+	// Create direct blockchain service
+	paymentGateway, err := blockchain.NewPaymentGatewayServiceDirect(
+		"https://sepolia.infura.io/v3/YOUR_PROJECT_ID", // Ethereum RPC URL
+		"0xYourContractAddress",                        // Contract address
+		"your_private_key_hex",                         // Private key
+	)
+	if err != nil {
+		log.Printf("Failed to create direct payment gateway: %v", err)
+		return
+	}
+	defer paymentGateway.Close()
+
+	exampleRespondToOfferIntegration(paymentGateway)
+}
+
+// Example 3: Hybrid Mode
+func exampleHybridMode() {
+	// Create hybrid service (direct + HTTP fallback)
+	paymentGateway, err := blockchain.NewPaymentGatewayServiceHybrid(
+		"https://sepolia.infura.io/v3/YOUR_PROJECT_ID", // Ethereum RPC URL
+		"0xYourContractAddress",                        // Contract address
+		"your_private_key_hex",                         // Private key
+		"http://localhost:8081",                        // HTTP fallback URL
+	)
+	if err != nil {
+		log.Printf("Failed to create hybrid payment gateway: %v", err)
+		return
+	}
+	defer paymentGateway.Close()
+
+	exampleRespondToOfferIntegration(paymentGateway)
+}
+
+// Example 4: Using advanced configuration
+func exampleAdvancedConfiguration() {
+	// Create service with advanced configuration
+	paymentGateway, err := blockchain.NewPaymentGatewayService(blockchain.ServiceConfig{
+		Mode:            blockchain.HybridMode,
+		BaseURL:         "http://localhost:8081",
+		EthereumRPCURL:  os.Getenv("ETHEREUM_RPC_URL"),
+		ContractAddress: os.Getenv("CONTRACT_ADDRESS"),
+		PrivateKey:      os.Getenv("PRIVATE_KEY"),
+		GasLimit:        350000, // Custom gas limit
+	})
+	if err != nil {
+		log.Printf("Failed to create advanced payment gateway: %v", err)
+		return
+	}
+	defer paymentGateway.Close()
+
+	exampleRespondToOfferIntegration(paymentGateway)
+}
+
+// Example integration with RespondToOffer method
 func exampleRespondToOfferIntegration(paymentGateway *blockchain.PaymentGatewayService) {
 	ctx := context.Background()
 
-	// This would be your application data from the database
-	applicationID := int32(123)
-	freelancerWallet := "0x742C4356e2B18C51EB9D0CbaF6A1A6c0C8c7DBCE"
-	posterWallet := "0x8ba1f109551bD432803012645Hac136c4Ce7"
-	agreedUSDAmount := int32(100)
+	// Mock data - would come from your database
+	applicationID := uint64(123)
+	freelancerWallet := "0x742e4C7aBd4C77d7084b7Bc2E8E73B0b54e8a9e1"
+	clientWallet := "0x8ba1f109551bD432803012645Hac136c82F57eBF"
+	agreedAmount := "150.00" // USD
 
-	// Create the request
+	// This would be called when candidate accepts offer
+	fmt.Printf("Processing job acceptance for application %d...\n", applicationID)
+
+	// Fund escrow
 	req := blockchain.PostJobRequest{
-		JobID:             uint64(applicationID), // Using application.id as escrow job_id
+		JobID:             applicationID,
 		FreelancerAddress: freelancerWallet,
-		USDAmount:         fmt.Sprintf("%d", agreedUSDAmount),
-		ClientAddress:     posterWallet,
+		USDAmount:         agreedAmount,
+		ClientAddress:     clientWallet,
 	}
 
-	// Call the payment gateway to fund escrow
 	result, err := paymentGateway.PostJob(ctx, req)
 	if err != nil {
 		log.Printf("Failed to fund escrow: %v", err)
 		return
 	}
 
-	log.Printf("Escrow funded successfully! TxHash: %s", result.TxHash)
+	fmt.Printf("✅ Escrow funded successfully!")
+	fmt.Printf("   Transaction Hash: %s\n", result.TxHash)
+	fmt.Printf("   Block Number: %d\n", result.BlockNumber)
+	fmt.Printf("   Gas Used: %d\n", result.GasUsed)
 
-	// In your actual code, you would also:
-	// 1. Update applications.payment_status = 'deposit_initiated'
-	// 2. Update applications.escrow_tx_hash_deposit = result.TxHash
-	// 3. You might want to poll or use webhooks to confirm when it's mined, then update to 'deposited'
+	// Check payment status
+	status, err := paymentGateway.GetJobStatus(ctx, applicationID)
+	if err != nil {
+		log.Printf("Failed to get job status: %v", err)
+		return
+	}
+
+	fmt.Printf("📊 Current Status:")
+	fmt.Printf("   Payment Status: %s\n", status.PaymentStatus)
+	fmt.Printf("   USD Amount: $%s\n", status.USDAmount)
 }
 
-// Example integration for PosterReviewWork (when poster approves work)
+// Example integration with PosterReviewWork method
 func examplePosterReviewWorkIntegration(paymentGateway *blockchain.PaymentGatewayService) {
 	ctx := context.Background()
+	applicationID := uint64(123)
 
-	applicationID := int32(123)
+	// This would be called when poster approves work
+	fmt.Printf("Processing work approval for application %d...\n", applicationID)
 
-	// This would be called when poster approves work AND payment_status == "deposited"
-	result, err := paymentGateway.CompleteJob(ctx, uint64(applicationID))
+	result, err := paymentGateway.CompleteJob(ctx, applicationID)
 	if err != nil {
 		log.Printf("Failed to release payment: %v", err)
 		return
 	}
 
-	log.Printf("Payment released successfully! TxHash: %s", result.TxHash)
+	fmt.Printf("✅ Payment released successfully!")
+	fmt.Printf("   Transaction Hash: %s\n", result.TxHash)
+	fmt.Printf("   Block Number: %d\n", result.BlockNumber)
+	fmt.Printf("   Gas Used: %d\n", result.GasUsed)
+}
 
-	// In your actual code, you would also:
-	// 1. Update applications.payment_status = 'release_initiated'
-	// 2. Update applications.escrow_tx_hash_release = result.TxHash
-	// 3. Once confirmed, update to 'released' and potentially close the job
+// Example Application Service Integration
+func exampleAppServiceIntegration() {
+	// This shows how you'd integrate with your existing application service
+
+	fmt.Println("// In your ApplicationService initialization:")
+	fmt.Println(`
+type ApplicationService struct {
+    Queries        *db.Queries
+    PaymentGateway *blockchain.PaymentGatewayService
+}
+
+func NewApplicationService(queries *db.Queries) (*ApplicationService, error) {
+    // Option 1: Direct mode (no server needed)
+    paymentGateway, err := blockchain.NewPaymentGatewayServiceDirect(
+        os.Getenv("ETHEREUM_RPC_URL"),
+        os.Getenv("CONTRACT_ADDRESS"),
+        os.Getenv("PRIVATE_KEY"),
+    )
+    if err != nil {
+        return nil, err
+    }
+
+    // Option 2: Hybrid mode (direct + HTTP fallback)
+    // paymentGateway, err := blockchain.NewPaymentGatewayServiceHybrid(
+    //     os.Getenv("ETHEREUM_RPC_URL"),
+    //     os.Getenv("CONTRACT_ADDRESS"),
+    //     os.Getenv("PRIVATE_KEY"),
+    //     "http://localhost:8081",
+    // )
+
+    // Option 3: HTTP-only mode (backward compatible)
+    // paymentGateway := blockchain.NewPaymentGatewayServiceHTTP("http://localhost:8081")
+
+    return &ApplicationService{
+        Queries:        queries,
+        PaymentGateway: paymentGateway,
+    }, nil
+}`)
+
+	fmt.Println("\n// The rest of your integration code remains the same!")
+	fmt.Println("// All existing method calls (PostJob, CompleteJob, etc.) work unchanged")
+}
+
+// Example with environment configuration
+func exampleEnvironmentConfig() {
+	// Read from environment variables
+	mode := os.Getenv("PAYMENT_MODE") // "direct", "http", or "hybrid"
+
+	var paymentGateway *blockchain.PaymentGatewayService
+	var err error
+
+	switch mode {
+	case "direct":
+		paymentGateway, err = blockchain.NewPaymentGatewayServiceDirect(
+			os.Getenv("ETHEREUM_RPC_URL"),
+			os.Getenv("CONTRACT_ADDRESS"),
+			os.Getenv("PRIVATE_KEY"),
+		)
+	case "hybrid":
+		paymentGateway, err = blockchain.NewPaymentGatewayServiceHybrid(
+			os.Getenv("ETHEREUM_RPC_URL"),
+			os.Getenv("CONTRACT_ADDRESS"),
+			os.Getenv("PRIVATE_KEY"),
+			os.Getenv("PAYMENT_GATEWAY_URL"),
+		)
+	default: // "http"
+		paymentGateway = blockchain.NewPaymentGatewayServiceHTTP(
+			os.Getenv("PAYMENT_GATEWAY_URL"),
+		)
+	}
+
+	if err != nil {
+		log.Fatalf("Failed to initialize payment gateway: %v", err)
+	}
+	defer paymentGateway.Close()
+
+	// Use the service...
+	fmt.Printf("Payment gateway initialized in %s mode\n", mode)
 }
 
 /*

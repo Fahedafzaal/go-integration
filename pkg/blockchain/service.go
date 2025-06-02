@@ -5,24 +5,131 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"math/big"
 	"net/http"
+	"strconv"
 	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/fahedafzaal/go-integration/internal/config"
 )
 
-// PaymentGatewayService provides a client interface to the payment gateway microservice
+// PaymentMode defines the mode of operation for the payment gateway
+type PaymentMode int
+
+const (
+	// DirectMode uses direct blockchain interaction
+	DirectMode PaymentMode = iota
+	// HTTPMode uses HTTP calls to the payment gateway service
+	HTTPMode
+	// HybridMode tries direct first, falls back to HTTP
+	HybridMode
+)
+
+// PaymentGatewayService provides a unified interface for payment operations
+// It supports both direct blockchain interaction and HTTP-based calls
 type PaymentGatewayService struct {
-	BaseURL    string
-	HTTPClient *http.Client
+	mode       PaymentMode
+	client     *Client        // For direct blockchain interaction
+	baseURL    string         // For HTTP calls
+	httpClient *http.Client   // For HTTP calls
+	config     *config.Config // Configuration for direct mode
 }
 
-// NewPaymentGatewayService creates a new payment gateway service client
-func NewPaymentGatewayService(baseURL string) *PaymentGatewayService {
-	return &PaymentGatewayService{
-		BaseURL: baseURL,
-		HTTPClient: &http.Client{
+// ServiceConfig holds configuration for the payment gateway service
+type ServiceConfig struct {
+	Mode            PaymentMode
+	BaseURL         string // Required for HTTP and Hybrid modes
+	EthereumRPCURL  string // Required for Direct and Hybrid modes
+	ContractAddress string // Required for Direct and Hybrid modes
+	PrivateKey      string // Required for Direct and Hybrid modes
+	GasLimit        uint64 // Optional, defaults to 300000
+}
+
+// NewPaymentGatewayService creates a new payment gateway service
+func NewPaymentGatewayService(cfg ServiceConfig) (*PaymentGatewayService, error) {
+	service := &PaymentGatewayService{
+		mode: cfg.Mode,
+		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
 	}
+
+	// Initialize based on mode
+	switch cfg.Mode {
+	case DirectMode, HybridMode:
+		// Initialize blockchain client for direct interaction
+		if cfg.EthereumRPCURL == "" || cfg.ContractAddress == "" || cfg.PrivateKey == "" {
+			return nil, fmt.Errorf("ethereum RPC URL, contract address, and private key are required for direct mode")
+		}
+
+		gasLimit := cfg.GasLimit
+		if gasLimit == 0 {
+			gasLimit = 300000
+		}
+
+		config := &config.Config{
+			EthereumRPCURL:  cfg.EthereumRPCURL,
+			ContractAddress: cfg.ContractAddress,
+			PrivateKey:      cfg.PrivateKey,
+			GasLimit:        gasLimit,
+		}
+
+		client, err := NewClient(config)
+		if err != nil {
+			if cfg.Mode == DirectMode {
+				return nil, fmt.Errorf("failed to initialize blockchain client: %w", err)
+			}
+			// For hybrid mode, log the error but continue
+			log.Printf("Warning: Failed to initialize blockchain client, will use HTTP mode: %v", err)
+		} else {
+			service.client = client
+			service.config = config
+		}
+
+		if cfg.Mode == HybridMode {
+			service.baseURL = cfg.BaseURL
+		}
+
+	case HTTPMode:
+		if cfg.BaseURL == "" {
+			return nil, fmt.Errorf("base URL is required for HTTP mode")
+		}
+		service.baseURL = cfg.BaseURL
+	}
+
+	return service, nil
+}
+
+// NewPaymentGatewayServiceHTTP creates a service in HTTP-only mode (backward compatibility)
+func NewPaymentGatewayServiceHTTP(baseURL string) *PaymentGatewayService {
+	service, _ := NewPaymentGatewayService(ServiceConfig{
+		Mode:    HTTPMode,
+		BaseURL: baseURL,
+	})
+	return service
+}
+
+// NewPaymentGatewayServiceDirect creates a service in direct blockchain mode
+func NewPaymentGatewayServiceDirect(ethereumRPCURL, contractAddress, privateKey string) (*PaymentGatewayService, error) {
+	return NewPaymentGatewayService(ServiceConfig{
+		Mode:            DirectMode,
+		EthereumRPCURL:  ethereumRPCURL,
+		ContractAddress: contractAddress,
+		PrivateKey:      privateKey,
+	})
+}
+
+// NewPaymentGatewayServiceHybrid creates a service in hybrid mode (direct + HTTP fallback)
+func NewPaymentGatewayServiceHybrid(ethereumRPCURL, contractAddress, privateKey, baseURL string) (*PaymentGatewayService, error) {
+	return NewPaymentGatewayService(ServiceConfig{
+		Mode:            HybridMode,
+		EthereumRPCURL:  ethereumRPCURL,
+		ContractAddress: contractAddress,
+		PrivateKey:      privateKey,
+		BaseURL:         baseURL,
+	})
 }
 
 // PostJobRequest represents the request for posting a job to escrow
@@ -58,99 +165,370 @@ type JobStatusResponse struct {
 
 // PostJob initiates escrow funding when candidate accepts offer
 func (s *PaymentGatewayService) PostJob(ctx context.Context, req PostJobRequest) (*TransactionResponse, error) {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	// Try direct blockchain interaction first (if available)
+	if s.canUseDirect() {
+		result, err := s.postJobDirect(ctx, req)
+		if err == nil {
+			return result, nil
+		}
+
+		log.Printf("Direct blockchain call failed: %v", err)
+
+		// If we're in direct mode only, return the error
+		if s.mode == DirectMode {
+			return nil, fmt.Errorf("direct blockchain interaction failed: %w", err)
+		}
+
+		// Otherwise, fall back to HTTP
+		log.Printf("Falling back to HTTP mode")
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", s.BaseURL+"/post-job", bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := s.HTTPClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("request failed with status %d", resp.StatusCode)
+	// Use HTTP mode
+	if s.canUseHTTP() {
+		return s.postJobHTTP(ctx, req)
 	}
 
-	var result TransactionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	return &result, nil
+	return nil, fmt.Errorf("no available payment method")
 }
 
 // CompleteJob releases payment when poster approves work
 func (s *PaymentGatewayService) CompleteJob(ctx context.Context, jobID uint64) (*TransactionResponse, error) {
-	url := fmt.Sprintf("%s/complete-job?job_id=%d", s.BaseURL, jobID)
+	// Try direct blockchain interaction first (if available)
+	if s.canUseDirect() {
+		result, err := s.completeJobDirect(ctx, jobID)
+		if err == nil {
+			return result, nil
+		}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		log.Printf("Direct blockchain call failed: %v", err)
+
+		// If we're in direct mode only, return the error
+		if s.mode == DirectMode {
+			return nil, fmt.Errorf("direct blockchain interaction failed: %w", err)
+		}
+
+		// Otherwise, fall back to HTTP
+		log.Printf("Falling back to HTTP mode")
 	}
 
-	resp, err := s.HTTPClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("request failed with status %d", resp.StatusCode)
+	// Use HTTP mode
+	if s.canUseHTTP() {
+		return s.completeJobHTTP(ctx, jobID)
 	}
 
-	var result TransactionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	return &result, nil
+	return nil, fmt.Errorf("no available payment method")
 }
 
 // CancelJob initiates refund for cancelled jobs
 func (s *PaymentGatewayService) CancelJob(ctx context.Context, jobID uint64) (*TransactionResponse, error) {
-	url := fmt.Sprintf("%s/cancel-job?job_id=%d", s.BaseURL, jobID)
+	// Try direct blockchain interaction first (if available)
+	if s.canUseDirect() {
+		result, err := s.cancelJobDirect(ctx, jobID)
+		if err == nil {
+			return result, nil
+		}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		log.Printf("Direct blockchain call failed: %v", err)
+
+		// If we're in direct mode only, return the error
+		if s.mode == DirectMode {
+			return nil, fmt.Errorf("direct blockchain interaction failed: %w", err)
+		}
+
+		// Otherwise, fall back to HTTP
+		log.Printf("Falling back to HTTP mode")
 	}
 
-	resp, err := s.HTTPClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("request failed with status %d", resp.StatusCode)
+	// Use HTTP mode
+	if s.canUseHTTP() {
+		return s.cancelJobHTTP(ctx, jobID)
 	}
 
-	var result TransactionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	return &result, nil
+	return nil, fmt.Errorf("no available payment method")
 }
 
 // GetJobStatus retrieves current payment status
 func (s *PaymentGatewayService) GetJobStatus(ctx context.Context, jobID uint64) (*JobStatusResponse, error) {
-	url := fmt.Sprintf("%s/job-status?job_id=%d", s.BaseURL, jobID)
+	// Try direct blockchain interaction first (if available)
+	if s.canUseDirect() {
+		result, err := s.getJobStatusDirect(ctx, jobID)
+		if err == nil {
+			return result, nil
+		}
+
+		log.Printf("Direct blockchain call failed: %v", err)
+
+		// If we're in direct mode only, return the error
+		if s.mode == DirectMode {
+			return nil, fmt.Errorf("direct blockchain interaction failed: %w", err)
+		}
+
+		// Otherwise, fall back to HTTP
+		log.Printf("Falling back to HTTP mode")
+	}
+
+	// Use HTTP mode
+	if s.canUseHTTP() {
+		return s.getJobStatusHTTP(ctx, jobID)
+	}
+
+	return nil, fmt.Errorf("no available payment method")
+}
+
+// GetETHUSDPrice gets current ETH/USD price
+func (s *PaymentGatewayService) GetETHUSDPrice(ctx context.Context) (*big.Int, error) {
+	// Try direct blockchain interaction first (if available)
+	if s.canUseDirect() {
+		price, err := s.client.GetETHUSDPrice(ctx)
+		if err == nil {
+			return price, nil
+		}
+
+		log.Printf("Direct blockchain call failed: %v", err)
+
+		// If we're in direct mode only, return the error
+		if s.mode == DirectMode {
+			return nil, fmt.Errorf("direct blockchain interaction failed: %w", err)
+		}
+
+		// Otherwise, fall back to HTTP
+		log.Printf("Falling back to HTTP mode")
+	}
+
+	// Use HTTP mode
+	if s.canUseHTTP() {
+		return s.getETHUSDPriceHTTP(ctx)
+	}
+
+	return nil, fmt.Errorf("no available payment method")
+}
+
+// Helper methods to check if modes are available
+func (s *PaymentGatewayService) canUseDirect() bool {
+	return s.client != nil && (s.mode == DirectMode || s.mode == HybridMode)
+}
+
+func (s *PaymentGatewayService) canUseHTTP() bool {
+	return s.baseURL != "" && (s.mode == HTTPMode || s.mode == HybridMode)
+}
+
+// Direct blockchain interaction methods
+func (s *PaymentGatewayService) postJobDirect(ctx context.Context, req PostJobRequest) (*TransactionResponse, error) {
+	// Parse USD amount
+	usdAmountFloat, err := strconv.ParseFloat(req.USDAmount, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid USD amount: %w", err)
+	}
+
+	// Convert to wei (assuming 2 decimal places for USD)
+	usdAmountWei := big.NewInt(int64(usdAmountFloat * 100))
+
+	// Parse addresses
+	freelancerAddr := common.HexToAddress(req.FreelancerAddress)
+	clientAddr := common.HexToAddress(req.ClientAddress)
+
+	// Execute blockchain transaction
+	result, err := s.client.PostJob(ctx, req.JobID, freelancerAddr, usdAmountWei, clientAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	return &TransactionResponse{
+		TxHash:      result.TxHash,
+		BlockNumber: result.BlockNumber,
+		GasUsed:     result.GasUsed,
+		Success:     result.Success,
+		Error:       "",
+	}, nil
+}
+
+func (s *PaymentGatewayService) completeJobDirect(ctx context.Context, jobID uint64) (*TransactionResponse, error) {
+	result, err := s.client.MarkJobCompleted(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &TransactionResponse{
+		TxHash:      result.TxHash,
+		BlockNumber: result.BlockNumber,
+		GasUsed:     result.GasUsed,
+		Success:     result.Success,
+		Error:       "",
+	}, nil
+}
+
+func (s *PaymentGatewayService) cancelJobDirect(ctx context.Context, jobID uint64) (*TransactionResponse, error) {
+	result, err := s.client.CancelJob(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &TransactionResponse{
+		TxHash:      result.TxHash,
+		BlockNumber: result.BlockNumber,
+		GasUsed:     result.GasUsed,
+		Success:     result.Success,
+		Error:       "",
+	}, nil
+}
+
+func (s *PaymentGatewayService) getJobStatusDirect(ctx context.Context, jobID uint64) (*JobStatusResponse, error) {
+	details, err := s.client.GetJobDetails(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert amounts back to strings
+	usdAmountFloat := float64(details.USDAmount.Int64()) / 100.0
+	usdAmountStr := fmt.Sprintf("%.2f", usdAmountFloat)
+
+	// Determine payment status
+	paymentStatus := "pending"
+	if details.IsPaid {
+		paymentStatus = "released"
+	} else if details.IsCompleted {
+		paymentStatus = "completed"
+	} else if details.ETHAmount.Cmp(big.NewInt(0)) > 0 {
+		paymentStatus = "deposited"
+	}
+
+	return &JobStatusResponse{
+		JobID:             jobID,
+		ApplicationID:     int32(jobID), // Assuming jobID maps to application ID
+		FreelancerAddress: details.Freelancer.Hex(),
+		ClientAddress:     details.Client.Hex(),
+		USDAmount:         usdAmountStr,
+		PaymentStatus:     paymentStatus,
+		ApplicationStatus: "active", // This would need to be determined from your DB
+	}, nil
+}
+
+func (s *PaymentGatewayService) getETHUSDPriceHTTP(ctx context.Context) (*big.Int, error) {
+	url := fmt.Sprintf("%s/eth-price", s.baseURL)
 
 	httpReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	resp, err := s.HTTPClient.Do(httpReq)
+	resp, err := s.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("request failed with status %d", resp.StatusCode)
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	// Extract price from response
+	priceFloat, ok := result["price"].(float64)
+	if !ok {
+		return nil, fmt.Errorf("invalid price format in response")
+	}
+
+	// Convert to big.Int (assuming price is in USD with 8 decimal places like Chainlink)
+	price := big.NewInt(int64(priceFloat * 100000000))
+	return price, nil
+}
+
+// HTTP-based methods (existing implementation)
+func (s *PaymentGatewayService) postJobHTTP(ctx context.Context, req PostJobRequest) (*TransactionResponse, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", s.baseURL+"/post-job", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("request failed with status %d", resp.StatusCode)
+	}
+
+	var result TransactionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return &result, nil
+}
+
+func (s *PaymentGatewayService) completeJobHTTP(ctx context.Context, jobID uint64) (*TransactionResponse, error) {
+	url := fmt.Sprintf("%s/complete-job?job_id=%d", s.baseURL, jobID)
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := s.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("request failed with status %d", resp.StatusCode)
+	}
+
+	var result TransactionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return &result, nil
+}
+
+func (s *PaymentGatewayService) cancelJobHTTP(ctx context.Context, jobID uint64) (*TransactionResponse, error) {
+	url := fmt.Sprintf("%s/cancel-job?job_id=%d", s.baseURL, jobID)
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := s.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("request failed with status %d", resp.StatusCode)
+	}
+
+	var result TransactionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return &result, nil
+}
+
+func (s *PaymentGatewayService) getJobStatusHTTP(ctx context.Context, jobID uint64) (*JobStatusResponse, error) {
+	url := fmt.Sprintf("%s/job-status?job_id=%d", s.baseURL, jobID)
+
+	httpReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := s.httpClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute request: %w", err)
 	}
@@ -168,16 +546,20 @@ func (s *PaymentGatewayService) GetJobStatus(ctx context.Context, jobID uint64) 
 	return &result, nil
 }
 
-// ConfirmDeposit confirms that a deposit transaction has been mined
+// ConfirmDeposit confirms that a deposit transaction has been mined (HTTP only for now)
 func (s *PaymentGatewayService) ConfirmDeposit(ctx context.Context, jobID uint64) error {
-	url := fmt.Sprintf("%s/confirm-deposit?job_id=%d", s.BaseURL, jobID)
+	if !s.canUseHTTP() {
+		return fmt.Errorf("HTTP mode not available for confirmation")
+	}
+
+	url := fmt.Sprintf("%s/confirm-deposit?job_id=%d", s.baseURL, jobID)
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 
-	resp, err := s.HTTPClient.Do(httpReq)
+	resp, err := s.httpClient.Do(httpReq)
 	if err != nil {
 		return fmt.Errorf("failed to execute request: %w", err)
 	}
@@ -190,16 +572,20 @@ func (s *PaymentGatewayService) ConfirmDeposit(ctx context.Context, jobID uint64
 	return nil
 }
 
-// ConfirmRelease confirms that a release transaction has been mined
+// ConfirmRelease confirms that a release transaction has been mined (HTTP only for now)
 func (s *PaymentGatewayService) ConfirmRelease(ctx context.Context, jobID uint64) error {
-	url := fmt.Sprintf("%s/confirm-release?job_id=%d", s.BaseURL, jobID)
+	if !s.canUseHTTP() {
+		return fmt.Errorf("HTTP mode not available for confirmation")
+	}
+
+	url := fmt.Sprintf("%s/confirm-release?job_id=%d", s.baseURL, jobID)
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 
-	resp, err := s.HTTPClient.Do(httpReq)
+	resp, err := s.httpClient.Do(httpReq)
 	if err != nil {
 		return fmt.Errorf("failed to execute request: %w", err)
 	}
@@ -210,4 +596,11 @@ func (s *PaymentGatewayService) ConfirmRelease(ctx context.Context, jobID uint64
 	}
 
 	return nil
+}
+
+// Close cleans up resources
+func (s *PaymentGatewayService) Close() {
+	if s.client != nil {
+		s.client.Close()
+	}
 }
