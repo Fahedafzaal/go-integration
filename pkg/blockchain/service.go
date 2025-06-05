@@ -175,13 +175,23 @@ func (s *PaymentGatewayService) PostJob(ctx context.Context, req PostJobRequest)
 		} else if exists {
 			log.Printf("Job %d already exists in smart contract", req.JobID)
 
-			// Get job state for proper error reporting
+			// Get job state for proper error reporting and auto-recovery
 			status, err := s.CheckAndReconcileJobState(ctx, req.JobID)
 			if err != nil {
 				return nil, fmt.Errorf("job %d already exists in smart contract, but failed to get state: %w", req.JobID, err)
 			}
 
-			// Return an error with detailed state information
+			// For pending_deposit state, return a success response with empty hash to trigger database sync
+			if status.PaymentStatus == "pending_deposit" {
+				log.Printf("Info: Job %d exists in smart contract with pending_deposit status - returning success for database sync", req.JobID)
+				return &TransactionResponse{
+					TxHash:  "", // Empty hash indicates existing job
+					Success: true,
+					Error:   fmt.Sprintf("job_exists_pending_deposit:%s", status.PaymentStatus),
+				}, nil
+			}
+
+			// For other states, return proper error
 			return nil, fmt.Errorf("job %d already exists in smart contract with status '%s' - use CheckAndReconcileJobState() to sync database", req.JobID, status.PaymentStatus)
 		}
 	}
@@ -194,7 +204,18 @@ func (s *PaymentGatewayService) PostJob(ctx context.Context, req PostJobRequest)
 			if strings.Contains(err.Error(), "job already exists") || strings.Contains(err.Error(), "Job already exists") {
 				log.Printf("Job %d already exists in smart contract (detected via error)", req.JobID)
 
-				// Return a proper error instead of success
+				// Get job state for auto-recovery
+				status, stateErr := s.CheckAndReconcileJobState(ctx, req.JobID)
+				if stateErr == nil && status.PaymentStatus == "pending_deposit" {
+					log.Printf("Info: Job %d already exists with pending_deposit status - returning success for database sync", req.JobID)
+					return &TransactionResponse{
+						TxHash:  "", // Empty hash indicates existing job
+						Success: true,
+						Error:   fmt.Sprintf("job_exists_pending_deposit:%s", status.PaymentStatus),
+					}, nil
+				}
+
+				// Return error for other states or if we can't determine state
 				return nil, fmt.Errorf("job %d already exists in smart contract - detected during transaction: %w", req.JobID, err)
 			}
 
