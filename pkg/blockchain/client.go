@@ -127,32 +127,88 @@ func (c *Client) PostJob(ctx context.Context, jobID uint64, freelancer common.Ad
 		return nil, fmt.Errorf("job %d already exists in smart contract", jobID)
 	}
 
+	// DEBUG: Log the USD amount being converted
+	log.Printf("DEBUG PostJob: Converting USD amount %s to ETH for job %d", usdAmount.String(), jobID)
+
+	// DEBUG: Check ETH price first
+	ethPrice, priceErr := c.GetETHUSDPrice(ctx)
+	if priceErr != nil {
+		log.Printf("ERROR PostJob: Failed to get ETH price: %v", priceErr)
+	} else {
+		// Convert price to human readable format (Chainlink uses 8 decimals)
+		priceFloat := new(big.Float).Quo(new(big.Float).SetInt(ethPrice), new(big.Float).SetInt64(1e8))
+		log.Printf("DEBUG PostJob: Current ETH price: $%s", priceFloat.String())
+	}
+
 	// Get current ETH price and calculate required ETH
 	ethAmount, err := c.contract.ConvertUsdToEth(&bind.CallOpts{Context: ctx}, usdAmount)
 	if err != nil {
+		log.Printf("ERROR PostJob: Failed to convert USD to ETH: %v", err)
 		return nil, err
+	}
+
+	// DEBUG: Log the calculated ETH amount
+	log.Printf("DEBUG PostJob: Calculated ETH amount: %s wei (%.6f ETH) for job %d",
+		ethAmount.String(),
+		new(big.Float).Quo(new(big.Float).SetInt(ethAmount), new(big.Float).SetInt64(1e18)),
+		jobID)
+
+	// DEBUG: Check wallet balance before transaction
+	balance, balErr := c.GetBalance(ctx, c.publicAddress)
+	if balErr != nil {
+		log.Printf("WARNING PostJob: Could not check wallet balance: %v", balErr)
+	} else {
+		log.Printf("DEBUG PostJob: Wallet %s balance: %s wei (%.6f ETH)",
+			c.publicAddress.Hex(),
+			balance.String(),
+			new(big.Float).Quo(new(big.Float).SetInt(balance), new(big.Float).SetInt64(1e18)))
+
+		// Check if we have sufficient balance
+		if balance.Cmp(ethAmount) < 0 {
+			return nil, fmt.Errorf("insufficient balance: need %s wei but only have %s wei", ethAmount.String(), balance.String())
+		}
 	}
 
 	// Get transaction options
 	auth, err := c.GetAuth(ctx)
 	if err != nil {
+		log.Printf("ERROR PostJob: Failed to get auth: %v", err)
 		return nil, err
 	}
 
 	// Set the value to send (ETH amount)
 	auth.Value = ethAmount
 
+	// DEBUG: Log transaction details
+	log.Printf("DEBUG PostJob: Sending transaction for job %d with ETH value: %s wei", jobID, auth.Value.String())
+	log.Printf("DEBUG PostJob: Transaction params - JobID: %d, Freelancer: %s, USD: %s, Client: %s",
+		jobID, freelancer.Hex(), usdAmount.String(), client.Hex())
+
 	// Execute transaction
 	tx, err := c.contract.PostJob(auth, big.NewInt(int64(jobID)), freelancer, usdAmount, client)
 	if err != nil {
+		log.Printf("ERROR PostJob: Transaction failed: %v", err)
 		return &TransactionResult{
 			Success: false,
 			Error:   err,
 		}, err
 	}
 
+	// DEBUG: Log transaction hash
+	log.Printf("DEBUG PostJob: Transaction submitted successfully, hash: %s", tx.Hash().Hex())
+
 	// Wait for transaction confirmation with enhanced error checking
-	return c.waitForTransactionWithRetry(ctx, tx, 3)
+	result, err := c.waitForTransactionWithRetry(ctx, tx, 3)
+
+	// DEBUG: Log final result
+	if err != nil {
+		log.Printf("ERROR PostJob: Transaction confirmation failed: %v", err)
+	} else {
+		log.Printf("DEBUG PostJob: Transaction confirmed - Success: %v, Block: %d, Gas: %d",
+			result.Success, result.BlockNumber, result.GasUsed)
+	}
+
+	return result, err
 }
 
 // MarkJobCompleted marks a job as completed and releases payment

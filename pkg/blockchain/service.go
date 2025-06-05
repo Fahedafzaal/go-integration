@@ -166,14 +166,20 @@ type JobStatusResponse struct {
 
 // PostJob initiates escrow funding when candidate accepts offer
 func (s *PaymentGatewayService) PostJob(ctx context.Context, req PostJobRequest) (*TransactionResponse, error) {
+	// DEBUG: Log the incoming request
+	log.Printf("DEBUG PostJob: Starting PostJob for JobID=%d, USDAmount='%s', Freelancer=%s, Client=%s",
+		req.JobID, req.USDAmount, req.FreelancerAddress, req.ClientAddress)
+
 	// For direct mode, check smart contract state first
 	if s.canUseDirect() {
+		log.Printf("DEBUG PostJob: Using direct mode, checking smart contract state for job %d", req.JobID)
+
 		// Check if job already exists in smart contract
 		exists, err := s.client.JobExists(ctx, req.JobID)
 		if err != nil {
-			log.Printf("Warning: Could not check smart contract state: %v", err)
+			log.Printf("WARNING PostJob: Could not check smart contract state: %v", err)
 		} else if exists {
-			log.Printf("Job %d already exists in smart contract", req.JobID)
+			log.Printf("INFO PostJob: Job %d already exists in smart contract", req.JobID)
 
 			// Get job state for proper error reporting and auto-recovery
 			status, err := s.CheckAndReconcileJobState(ctx, req.JobID)
@@ -183,7 +189,7 @@ func (s *PaymentGatewayService) PostJob(ctx context.Context, req PostJobRequest)
 
 			// For pending_deposit state, return a success response with empty hash to trigger database sync
 			if status.PaymentStatus == "pending_deposit" {
-				log.Printf("Info: Job %d exists in smart contract with pending_deposit status - returning success for database sync", req.JobID)
+				log.Printf("INFO PostJob: Job %d exists in smart contract with pending_deposit status - returning success for database sync", req.JobID)
 				return &TransactionResponse{
 					TxHash:  "", // Empty hash indicates existing job
 					Success: true,
@@ -193,21 +199,24 @@ func (s *PaymentGatewayService) PostJob(ctx context.Context, req PostJobRequest)
 
 			// For other states, return proper error
 			return nil, fmt.Errorf("job %d already exists in smart contract with status '%s' - use CheckAndReconcileJobState() to sync database", req.JobID, status.PaymentStatus)
+		} else {
+			log.Printf("DEBUG PostJob: Job %d does not exist in smart contract, proceeding with creation", req.JobID)
 		}
 	}
 
 	// Try direct blockchain interaction first (if available)
 	if s.canUseDirect() {
+		log.Printf("DEBUG PostJob: Calling postJobDirect for job %d", req.JobID)
 		result, err := s.postJobDirect(ctx, req)
 		if err != nil {
 			// Check if error is due to job already existing
 			if strings.Contains(err.Error(), "job already exists") || strings.Contains(err.Error(), "Job already exists") {
-				log.Printf("Job %d already exists in smart contract (detected via error)", req.JobID)
+				log.Printf("INFO PostJob: Job %d already exists in smart contract (detected via error)", req.JobID)
 
 				// Get job state for auto-recovery
 				status, stateErr := s.CheckAndReconcileJobState(ctx, req.JobID)
 				if stateErr == nil && status.PaymentStatus == "pending_deposit" {
-					log.Printf("Info: Job %d already exists with pending_deposit status - returning success for database sync", req.JobID)
+					log.Printf("INFO PostJob: Job %d already exists with pending_deposit status - returning success for database sync", req.JobID)
 					return &TransactionResponse{
 						TxHash:  "", // Empty hash indicates existing job
 						Success: true,
@@ -219,7 +228,7 @@ func (s *PaymentGatewayService) PostJob(ctx context.Context, req PostJobRequest)
 				return nil, fmt.Errorf("job %d already exists in smart contract - detected during transaction: %w", req.JobID, err)
 			}
 
-			log.Printf("Direct blockchain call failed: %v", err)
+			log.Printf("ERROR PostJob: Direct blockchain call failed: %v", err)
 
 			// If we're in direct mode only, return the error
 			if s.mode == DirectMode {
@@ -227,17 +236,20 @@ func (s *PaymentGatewayService) PostJob(ctx context.Context, req PostJobRequest)
 			}
 
 			// Otherwise, fall back to HTTP
-			log.Printf("Falling back to HTTP mode")
+			log.Printf("INFO PostJob: Falling back to HTTP mode")
 		} else {
+			log.Printf("DEBUG PostJob: Direct blockchain call successful for job %d", req.JobID)
 			return result, nil
 		}
 	}
 
 	// Use HTTP mode
 	if s.canUseHTTP() {
+		log.Printf("DEBUG PostJob: Using HTTP mode for job %d", req.JobID)
 		return s.postJobHTTP(ctx, req)
 	}
 
+	log.Printf("ERROR PostJob: No available payment method for job %d", req.JobID)
 	return nil, fmt.Errorf("no available payment method")
 }
 
@@ -364,24 +376,38 @@ func (s *PaymentGatewayService) canUseHTTP() bool {
 
 // Direct blockchain interaction methods
 func (s *PaymentGatewayService) postJobDirect(ctx context.Context, req PostJobRequest) (*TransactionResponse, error) {
+	// DEBUG: Log the incoming request
+	log.Printf("DEBUG postJobDirect: JobID=%d, USDAmount='%s', Freelancer=%s, Client=%s",
+		req.JobID, req.USDAmount, req.FreelancerAddress, req.ClientAddress)
+
 	// Parse USD amount
 	usdAmountFloat, err := strconv.ParseFloat(req.USDAmount, 64)
 	if err != nil {
+		log.Printf("ERROR postJobDirect: Invalid USD amount '%s': %v", req.USDAmount, err)
 		return nil, fmt.Errorf("invalid USD amount: %w", err)
 	}
 
 	// Convert to wei (assuming 2 decimal places for USD)
 	usdAmountWei := big.NewInt(int64(usdAmountFloat * 100))
 
+	// DEBUG: Log the conversion
+	log.Printf("DEBUG postJobDirect: Parsed USD %.2f -> %s wei (for smart contract)", usdAmountFloat, usdAmountWei.String())
+
 	// Parse addresses
 	freelancerAddr := common.HexToAddress(req.FreelancerAddress)
 	clientAddr := common.HexToAddress(req.ClientAddress)
 
+	// DEBUG: Log parsed addresses
+	log.Printf("DEBUG postJobDirect: Freelancer address: %s, Client address: %s", freelancerAddr.Hex(), clientAddr.Hex())
+
 	// Execute blockchain transaction
 	result, err := s.client.PostJob(ctx, req.JobID, freelancerAddr, usdAmountWei, clientAddr)
 	if err != nil {
+		log.Printf("ERROR postJobDirect: Blockchain transaction failed: %v", err)
 		return nil, err
 	}
+
+	log.Printf("DEBUG postJobDirect: Blockchain transaction successful - TxHash: %s, Success: %v", result.TxHash, result.Success)
 
 	return &TransactionResponse{
 		TxHash:      result.TxHash,
@@ -668,6 +694,7 @@ func (s *PaymentGatewayService) CheckAndReconcileJobState(ctx context.Context, j
 	}
 
 	if !exists {
+		log.Printf("DEBUG CheckState: Job %d does not exist in smart contract", jobID)
 		return &JobStatusResponse{
 			JobID:         jobID,
 			ApplicationID: int32(jobID),
@@ -675,11 +702,23 @@ func (s *PaymentGatewayService) CheckAndReconcileJobState(ctx context.Context, j
 		}, nil
 	}
 
+	log.Printf("DEBUG CheckState: Job %d exists in smart contract, getting details...", jobID)
+
 	// Get job details from smart contract
 	details, err := s.client.GetJobDetails(ctx, jobID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get job details: %w", err)
 	}
+
+	// DEBUG: Log raw blockchain data
+	log.Printf("DEBUG CheckState: Job %d blockchain details:", jobID)
+	log.Printf("  - Client: %s", details.Client.Hex())
+	log.Printf("  - Freelancer: %s", details.Freelancer.Hex())
+	log.Printf("  - USDAmount: %s", details.USDAmount.String())
+	log.Printf("  - ETHAmount: %s wei (%.6f ETH)", details.ETHAmount.String(),
+		new(big.Float).Quo(new(big.Float).SetInt(details.ETHAmount), new(big.Float).SetInt64(1e18)))
+	log.Printf("  - IsCompleted: %v", details.IsCompleted)
+	log.Printf("  - IsPaid: %v", details.IsPaid)
 
 	// Convert amounts back to strings
 	usdAmountFloat := float64(details.USDAmount.Int64()) / 100.0
@@ -689,11 +728,18 @@ func (s *PaymentGatewayService) CheckAndReconcileJobState(ctx context.Context, j
 	paymentStatus := "pending_deposit"
 	if details.IsPaid {
 		paymentStatus = "released"
+		log.Printf("DEBUG CheckState: Job %d is PAID (released)", jobID)
 	} else if details.IsCompleted {
 		paymentStatus = "completed"
+		log.Printf("DEBUG CheckState: Job %d is COMPLETED but not paid", jobID)
 	} else if details.ETHAmount.Cmp(big.NewInt(0)) > 0 {
 		paymentStatus = "deposited"
+		log.Printf("DEBUG CheckState: Job %d has ETH deposit (%s wei) - status: deposited", jobID, details.ETHAmount.String())
+	} else {
+		log.Printf("DEBUG CheckState: Job %d has NO ETH deposit (corrupted state) - status: pending_deposit", jobID)
 	}
+
+	log.Printf("DEBUG CheckState: Final determined status for job %d: %s", jobID, paymentStatus)
 
 	return &JobStatusResponse{
 		JobID:             jobID,
