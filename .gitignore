@@ -24,9 +24,5 @@ go.work
 *.swp
 *.swo
 
-# Documentation and Local Guides (not for remote repo)
-API_DOCUMENTATION.md
-INTEGRATION_GUIDE.md
-MIGRATION_GUIDE.md
-README-Local.md
-SEPOLIA_TESTING_GUIDE.md
+# Documentation
+docs/

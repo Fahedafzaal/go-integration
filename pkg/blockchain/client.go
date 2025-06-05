@@ -121,21 +121,10 @@ func (c *Client) PostJob(ctx context.Context, jobID uint64, freelancer common.Ad
 		return nil, fmt.Errorf("failed to check if job exists: %w", err)
 	}
 	if exists {
-		log.Printf("Job %d already exists in smart contract, checking state", jobID)
-		// Get job details to return consistent response
-		_, err := c.GetJobDetails(ctx, jobID)
-		if err != nil {
-			return nil, fmt.Errorf("job exists but failed to get details: %w", err)
-		}
+		log.Printf("Job %d already exists in smart contract", jobID)
 
-		// Return success since job is already funded
-		return &TransactionResult{
-			TxHash:      "", // No new transaction
-			BlockNumber: 0,
-			GasUsed:     0,
-			Success:     true,
-			Error:       nil,
-		}, nil
+		// Return an error instead of success to maintain clear semantics
+		return nil, fmt.Errorf("job %d already exists in smart contract", jobID)
 	}
 
 	// Get current ETH price and calculate required ETH

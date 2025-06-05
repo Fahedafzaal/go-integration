@@ -180,6 +180,13 @@ func (pg *PaymentGateway) postJobHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Validate transaction result - don't proceed if transaction hash is empty
+	if result.TxHash == "" {
+		log.Printf("Error: PostJob returned success but with empty transaction hash for application %d", applicationID)
+		http.Error(w, "Blockchain operation failed: empty transaction hash", http.StatusInternalServerError)
+		return
+	}
+
 	// Use atomic database update to prevent race conditions
 	if err := pg.db.AtomicStartEscrowDeposit(ctx, applicationID, result.TxHash); err != nil {
 		log.Printf("Warning: Blockchain transaction succeeded but database update failed: %v", err)

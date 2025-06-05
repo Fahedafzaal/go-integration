@@ -173,22 +173,16 @@ func (s *PaymentGatewayService) PostJob(ctx context.Context, req PostJobRequest)
 		if err != nil {
 			log.Printf("Warning: Could not check smart contract state: %v", err)
 		} else if exists {
-			log.Printf("Job %d already exists in smart contract, skipping transaction", req.JobID)
+			log.Printf("Job %d already exists in smart contract", req.JobID)
 
-			// Get job state for consistency
+			// Get job state for proper error reporting
 			status, err := s.CheckAndReconcileJobState(ctx, req.JobID)
 			if err != nil {
-				log.Printf("Warning: Could not get smart contract state: %v", err)
-			} else {
-				// Return a success response with smart contract state
-				return &TransactionResponse{
-					TxHash:      "", // No new transaction needed
-					BlockNumber: 0,
-					GasUsed:     0,
-					Success:     true,
-					Error:       fmt.Sprintf("Job already exists on blockchain with status: %s", status.PaymentStatus),
-				}, nil
+				return nil, fmt.Errorf("job %d already exists in smart contract, but failed to get state: %w", req.JobID, err)
 			}
+
+			// Return an error with detailed state information
+			return nil, fmt.Errorf("job %d already exists in smart contract with status '%s' - use CheckAndReconcileJobState() to sync database", req.JobID, status.PaymentStatus)
 		}
 	}
 
@@ -200,20 +194,8 @@ func (s *PaymentGatewayService) PostJob(ctx context.Context, req PostJobRequest)
 			if strings.Contains(err.Error(), "job already exists") || strings.Contains(err.Error(), "Job already exists") {
 				log.Printf("Job %d already exists in smart contract (detected via error)", req.JobID)
 
-				// Try to get the current state
-				status, stateErr := s.CheckAndReconcileJobState(ctx, req.JobID)
-				if stateErr == nil {
-					return &TransactionResponse{
-						TxHash:      "", // No new transaction
-						BlockNumber: 0,
-						GasUsed:     0,
-						Success:     true,
-						Error:       fmt.Sprintf("Job already exists with status: %s", status.PaymentStatus),
-					}, nil
-				}
-
-				// If we can't get state, return original error
-				return nil, fmt.Errorf("job already exists in smart contract: %w", err)
+				// Return a proper error instead of success
+				return nil, fmt.Errorf("job %d already exists in smart contract - detected during transaction: %w", req.JobID, err)
 			}
 
 			log.Printf("Direct blockchain call failed: %v", err)
