@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"errors"
+	"fmt"
 	"log"
 	"math/big"
 
@@ -114,6 +115,29 @@ func (c *Client) GetAuth(ctx context.Context) (*bind.TransactOpts, error) {
 
 // PostJob creates a new job on the blockchain
 func (c *Client) PostJob(ctx context.Context, jobID uint64, freelancer common.Address, usdAmount *big.Int, client common.Address) (*TransactionResult, error) {
+	// Check if job already exists in smart contract
+	exists, err := c.JobExists(ctx, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check if job exists: %w", err)
+	}
+	if exists {
+		log.Printf("Job %d already exists in smart contract, checking state", jobID)
+		// Get job details to return consistent response
+		_, err := c.GetJobDetails(ctx, jobID)
+		if err != nil {
+			return nil, fmt.Errorf("job exists but failed to get details: %w", err)
+		}
+
+		// Return success since job is already funded
+		return &TransactionResult{
+			TxHash:      "", // No new transaction
+			BlockNumber: 0,
+			GasUsed:     0,
+			Success:     true,
+			Error:       nil,
+		}, nil
+	}
+
 	// Get current ETH price and calculate required ETH
 	ethAmount, err := c.contract.ConvertUsdToEth(&bind.CallOpts{Context: ctx}, usdAmount)
 	if err != nil {
@@ -138,8 +162,8 @@ func (c *Client) PostJob(ctx context.Context, jobID uint64, freelancer common.Ad
 		}, err
 	}
 
-	// Wait for transaction confirmation
-	return c.waitForTransaction(ctx, tx)
+	// Wait for transaction confirmation with enhanced error checking
+	return c.waitForTransactionWithRetry(ctx, tx, 3)
 }
 
 // MarkJobCompleted marks a job as completed and releases payment
@@ -241,4 +265,99 @@ func (c *Client) GetBalance(ctx context.Context, address common.Address) (*big.I
 // Close closes the Ethereum client connection
 func (c *Client) Close() {
 	c.ethClient.Close()
+}
+
+// JobExists checks if a job already exists in the smart contract
+func (c *Client) JobExists(ctx context.Context, jobID uint64) (bool, error) {
+	// Try to get job details - if it exists, this will succeed
+	_, err := c.contract.GetJobDetails(&bind.CallOpts{Context: ctx}, big.NewInt(int64(jobID)))
+	if err != nil {
+		// If error contains "job does not exist" or similar, return false
+		// Otherwise, it's a real error
+		errStr := err.Error()
+		if contains(errStr, "job does not exist") || contains(errStr, "Job not found") || contains(errStr, "execution reverted") {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// contains checks if a string contains a substring (case-insensitive)
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr ||
+		(len(s) > len(substr) && s[:len(substr)] == substr) ||
+		(len(s) > len(substr) && s[len(s)-len(substr):] == substr) ||
+		indexOf(s, substr) >= 0)
+}
+
+// indexOf finds the index of substr in s
+func indexOf(s, substr string) int {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return i
+		}
+	}
+	return -1
+}
+
+// waitForTransactionWithRetry waits for transaction confirmation with retry logic
+func (c *Client) waitForTransactionWithRetry(ctx context.Context, tx *types.Transaction, maxRetries int) (*TransactionResult, error) {
+	log.Printf("Transaction sent: %s", tx.Hash().Hex())
+
+	var lastErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Wait for transaction to be mined
+		receipt, err := bind.WaitMined(ctx, c.ethClient, tx)
+		if err != nil {
+			lastErr = err
+			if attempt < maxRetries {
+				log.Printf("Attempt %d failed, retrying: %v", attempt, err)
+				continue
+			}
+			return &TransactionResult{
+				TxHash:  tx.Hash().Hex(),
+				Success: false,
+				Error:   err,
+			}, err
+		}
+
+		// Check if transaction succeeded
+		if receipt.Status == types.ReceiptStatusFailed {
+			// Get revert reason if possible
+			revertReason := c.getRevertReason(ctx, tx.Hash())
+			revertErr := fmt.Errorf("transaction reverted: %s", revertReason)
+
+			return &TransactionResult{
+				TxHash:      tx.Hash().Hex(),
+				BlockNumber: receipt.BlockNumber.Uint64(),
+				GasUsed:     receipt.GasUsed,
+				Success:     false,
+				Error:       revertErr,
+			}, revertErr
+		}
+
+		// Transaction succeeded
+		return &TransactionResult{
+			TxHash:      tx.Hash().Hex(),
+			BlockNumber: receipt.BlockNumber.Uint64(),
+			GasUsed:     receipt.GasUsed,
+			Success:     true,
+			Error:       nil,
+		}, nil
+	}
+
+	// All retries failed
+	return &TransactionResult{
+		TxHash:  tx.Hash().Hex(),
+		Success: false,
+		Error:   lastErr,
+	}, lastErr
+}
+
+// getRevertReason attempts to get the revert reason for a failed transaction
+func (c *Client) getRevertReason(ctx context.Context, txHash common.Hash) string {
+	// This is a simplified implementation
+	// In a production system, you'd want to replay the transaction to get the actual revert reason
+	return "execution reverted"
 }

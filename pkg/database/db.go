@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"fmt"
+	"log"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -176,6 +177,85 @@ func (db *DB) ValidateApplicationForBlockchain(ctx context.Context, applicationI
 	}
 
 	return nil
+}
+
+// CheckEscrowIdempotency checks if escrow funding has already been initiated for an application
+func (db *DB) CheckEscrowIdempotency(ctx context.Context, applicationID int32) (bool, string, error) {
+	var txHash *string
+	var paymentStatus string
+
+	query := `
+		SELECT payment_status, escrow_tx_hash_deposit
+		FROM applications 
+		WHERE id = $1
+	`
+
+	err := db.Pool.QueryRow(ctx, query, applicationID).Scan(&paymentStatus, &txHash)
+	if err != nil {
+		return false, "", fmt.Errorf("error checking escrow idempotency: %v", err)
+	}
+
+	// If there's already a deposit transaction hash, return true (already initiated)
+	if txHash != nil && *txHash != "" {
+		return true, *txHash, nil
+	}
+
+	// If payment status is not pending_deposit, it means deposit was already processed
+	if paymentStatus != "pending_deposit" && paymentStatus != "" {
+		return true, "", nil
+	}
+
+	return false, "", nil
+}
+
+// AtomicStartEscrowDeposit atomically marks an application as having escrow deposit initiated
+// This prevents race conditions from duplicate calls
+func (db *DB) AtomicStartEscrowDeposit(ctx context.Context, applicationID int32, txHash string) error {
+	// Use a transaction to ensure atomicity
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %v", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Check current state and update only if still pending
+	query := `
+		UPDATE applications 
+		SET payment_status = 'deposit_initiated', 
+		    escrow_tx_hash_deposit = $2
+		WHERE id = $1 
+		AND (payment_status = 'pending_deposit' OR payment_status IS NULL OR payment_status = '')
+		AND (escrow_tx_hash_deposit IS NULL OR escrow_tx_hash_deposit = '')
+	`
+
+	result, err := tx.Exec(ctx, query, applicationID, txHash)
+	if err != nil {
+		return fmt.Errorf("error updating application for escrow deposit: %v", err)
+	}
+
+	rowsAffected := result.RowsAffected()
+	if rowsAffected == 0 {
+		// No rows updated means either:
+		// 1. Application doesn't exist, or
+		// 2. Deposit was already initiated
+		// Check which case it is
+		var existingTxHash *string
+		checkQuery := `SELECT escrow_tx_hash_deposit FROM applications WHERE id = $1`
+		err := tx.QueryRow(ctx, checkQuery, applicationID).Scan(&existingTxHash)
+		if err != nil {
+			return fmt.Errorf("application not found or error checking existing state: %v", err)
+		}
+
+		if existingTxHash != nil && *existingTxHash != "" {
+			// Deposit already initiated - this is expected in idempotent scenarios
+			log.Printf("Escrow deposit already initiated for application %d (existing tx: %s)", applicationID, *existingTxHash)
+			return nil
+		}
+
+		return fmt.Errorf("failed to initiate escrow deposit - application may be in wrong state")
+	}
+
+	return tx.Commit(ctx)
 }
 
 // Close closes the database connection pool

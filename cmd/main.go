@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -96,6 +97,29 @@ func (pg *PaymentGateway) postJobHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Check if escrow deposit has already been initiated (idempotency check)
+	alreadyInitiated, existingTxHash, err := pg.db.CheckEscrowIdempotency(ctx, applicationID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to check escrow idempotency: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if alreadyInitiated {
+		log.Printf("Escrow deposit already initiated for application %d (tx: %s)", applicationID, existingTxHash)
+
+		// Return success response indicating deposit was already initiated
+		response := TransactionResponse{
+			TxHash:      existingTxHash,
+			BlockNumber: 0, // Not available for existing transactions
+			GasUsed:     0, // Not available for existing transactions
+			Success:     true,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
 	// Get application details from database
 	details, err := pg.db.GetApplicationPaymentDetails(ctx, applicationID)
 	if err != nil {
@@ -125,13 +149,41 @@ func (pg *PaymentGateway) postJobHandler(w http.ResponseWriter, r *http.Request)
 	// Post job to blockchain
 	result, err := pg.client.PostJob(ctx, req.JobID, freelancerAddr, usdAmount, clientAddr)
 	if err != nil {
+		// Check if the error is due to job already existing
+		if strings.Contains(err.Error(), "job already exists") || strings.Contains(err.Error(), "Job already exists") {
+			log.Printf("Job %d already exists in smart contract, attempting database reconciliation", req.JobID)
+
+			// Try to reconcile database state with smart contract
+			// Use a dummy transaction hash since we don't have access to the original one
+			reconcileTxHash := "existing_on_blockchain"
+
+			// Update database to reflect that deposit was initiated
+			if updateErr := pg.db.UpdatePaymentStatus(ctx, applicationID, "deposited", &reconcileTxHash, "deposit"); updateErr != nil {
+				log.Printf("Warning: Failed to reconcile database state: %v", updateErr)
+			}
+
+			// Return success response
+			response := TransactionResponse{
+				TxHash:      reconcileTxHash,
+				BlockNumber: 0,
+				GasUsed:     0,
+				Success:     true,
+				Error:       "Job already exists on blockchain",
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(response)
+			return
+		}
+
 		http.Error(w, fmt.Sprintf("Failed to post job to blockchain: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Update database with transaction hash
-	if err := pg.db.UpdatePaymentStatus(ctx, applicationID, "deposit_initiated", &result.TxHash, "deposit"); err != nil {
-		log.Printf("Warning: Failed to update payment status in database: %v", err)
+	// Use atomic database update to prevent race conditions
+	if err := pg.db.AtomicStartEscrowDeposit(ctx, applicationID, result.TxHash); err != nil {
+		log.Printf("Warning: Blockchain transaction succeeded but database update failed: %v", err)
+		// Don't fail the request since blockchain transaction succeeded
 	}
 
 	response := TransactionResponse{

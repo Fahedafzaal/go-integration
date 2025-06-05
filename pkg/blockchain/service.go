@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -165,22 +166,68 @@ type JobStatusResponse struct {
 
 // PostJob initiates escrow funding when candidate accepts offer
 func (s *PaymentGatewayService) PostJob(ctx context.Context, req PostJobRequest) (*TransactionResponse, error) {
+	// For direct mode, check smart contract state first
+	if s.canUseDirect() {
+		// Check if job already exists in smart contract
+		exists, err := s.client.JobExists(ctx, req.JobID)
+		if err != nil {
+			log.Printf("Warning: Could not check smart contract state: %v", err)
+		} else if exists {
+			log.Printf("Job %d already exists in smart contract, skipping transaction", req.JobID)
+
+			// Get job state for consistency
+			status, err := s.CheckAndReconcileJobState(ctx, req.JobID)
+			if err != nil {
+				log.Printf("Warning: Could not get smart contract state: %v", err)
+			} else {
+				// Return a success response with smart contract state
+				return &TransactionResponse{
+					TxHash:      "", // No new transaction needed
+					BlockNumber: 0,
+					GasUsed:     0,
+					Success:     true,
+					Error:       fmt.Sprintf("Job already exists on blockchain with status: %s", status.PaymentStatus),
+				}, nil
+			}
+		}
+	}
+
 	// Try direct blockchain interaction first (if available)
 	if s.canUseDirect() {
 		result, err := s.postJobDirect(ctx, req)
-		if err == nil {
+		if err != nil {
+			// Check if error is due to job already existing
+			if strings.Contains(err.Error(), "job already exists") || strings.Contains(err.Error(), "Job already exists") {
+				log.Printf("Job %d already exists in smart contract (detected via error)", req.JobID)
+
+				// Try to get the current state
+				status, stateErr := s.CheckAndReconcileJobState(ctx, req.JobID)
+				if stateErr == nil {
+					return &TransactionResponse{
+						TxHash:      "", // No new transaction
+						BlockNumber: 0,
+						GasUsed:     0,
+						Success:     true,
+						Error:       fmt.Sprintf("Job already exists with status: %s", status.PaymentStatus),
+					}, nil
+				}
+
+				// If we can't get state, return original error
+				return nil, fmt.Errorf("job already exists in smart contract: %w", err)
+			}
+
+			log.Printf("Direct blockchain call failed: %v", err)
+
+			// If we're in direct mode only, return the error
+			if s.mode == DirectMode {
+				return nil, fmt.Errorf("direct blockchain interaction failed: %w", err)
+			}
+
+			// Otherwise, fall back to HTTP
+			log.Printf("Falling back to HTTP mode")
+		} else {
 			return result, nil
 		}
-
-		log.Printf("Direct blockchain call failed: %v", err)
-
-		// If we're in direct mode only, return the error
-		if s.mode == DirectMode {
-			return nil, fmt.Errorf("direct blockchain interaction failed: %w", err)
-		}
-
-		// Otherwise, fall back to HTTP
-		log.Printf("Falling back to HTTP mode")
 	}
 
 	// Use HTTP mode
@@ -603,4 +650,55 @@ func (s *PaymentGatewayService) Close() {
 	if s.client != nil {
 		s.client.Close()
 	}
+}
+
+// CheckAndReconcileJobState checks smart contract state and reconciles with expected state
+func (s *PaymentGatewayService) CheckAndReconcileJobState(ctx context.Context, jobID uint64) (*JobStatusResponse, error) {
+	if !s.canUseDirect() {
+		return nil, fmt.Errorf("direct blockchain access required for state reconciliation")
+	}
+
+	// Check if job exists in smart contract
+	exists, err := s.client.JobExists(ctx, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check job existence: %w", err)
+	}
+
+	if !exists {
+		return &JobStatusResponse{
+			JobID:         jobID,
+			ApplicationID: int32(jobID),
+			PaymentStatus: "not_found",
+		}, nil
+	}
+
+	// Get job details from smart contract
+	details, err := s.client.GetJobDetails(ctx, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get job details: %w", err)
+	}
+
+	// Convert amounts back to strings
+	usdAmountFloat := float64(details.USDAmount.Int64()) / 100.0
+	usdAmountStr := fmt.Sprintf("%.2f", usdAmountFloat)
+
+	// Determine payment status based on smart contract state
+	paymentStatus := "pending_deposit"
+	if details.IsPaid {
+		paymentStatus = "released"
+	} else if details.IsCompleted {
+		paymentStatus = "completed"
+	} else if details.ETHAmount.Cmp(big.NewInt(0)) > 0 {
+		paymentStatus = "deposited"
+	}
+
+	return &JobStatusResponse{
+		JobID:             jobID,
+		ApplicationID:     int32(jobID),
+		FreelancerAddress: details.Freelancer.Hex(),
+		ClientAddress:     details.Client.Hex(),
+		USDAmount:         usdAmountStr,
+		PaymentStatus:     paymentStatus,
+		ApplicationStatus: "active",
+	}, nil
 }
