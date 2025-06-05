@@ -720,6 +720,21 @@ func (s *PaymentGatewayService) CheckAndReconcileJobState(ctx context.Context, j
 	log.Printf("  - IsCompleted: %v", details.IsCompleted)
 	log.Printf("  - IsPaid: %v", details.IsPaid)
 
+	// NEW: Detect corrupted/ghost jobs and treat them as "not found"
+	isCorrupted := (details.Client.Hex() == "0x0000000000000000000000000000000000000000" ||
+		details.Freelancer.Hex() == "0x0000000000000000000000000000000000000000" ||
+		details.USDAmount.Cmp(big.NewInt(0)) == 0)
+
+	if isCorrupted {
+		log.Printf("DEBUG CheckState: Job %d is CORRUPTED (null addresses or zero amount) - treating as 'not_found'", jobID)
+		log.Printf("INFO CheckState: Corrupted job %d can be safely overwritten with legitimate data", jobID)
+		return &JobStatusResponse{
+			JobID:         jobID,
+			ApplicationID: int32(jobID),
+			PaymentStatus: "not_found", // Allow overwriting corrupted jobs
+		}, nil
+	}
+
 	// Convert amounts back to strings
 	usdAmountFloat := float64(details.USDAmount.Int64()) / 100.0
 	usdAmountStr := fmt.Sprintf("%.2f", usdAmountFloat)
@@ -736,7 +751,7 @@ func (s *PaymentGatewayService) CheckAndReconcileJobState(ctx context.Context, j
 		paymentStatus = "deposited"
 		log.Printf("DEBUG CheckState: Job %d has ETH deposit (%s wei) - status: deposited", jobID, details.ETHAmount.String())
 	} else {
-		log.Printf("DEBUG CheckState: Job %d has NO ETH deposit (corrupted state) - status: pending_deposit", jobID)
+		log.Printf("DEBUG CheckState: Job %d has NO ETH deposit but valid addresses - status: pending_deposit", jobID)
 	}
 
 	log.Printf("DEBUG CheckState: Final determined status for job %d: %s", jobID, paymentStatus)

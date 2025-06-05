@@ -315,7 +315,7 @@ func (c *Client) Close() {
 // JobExists checks if a job already exists in the smart contract
 func (c *Client) JobExists(ctx context.Context, jobID uint64) (bool, error) {
 	// Try to get job details - if it exists, this will succeed
-	_, err := c.contract.GetJobDetails(&bind.CallOpts{Context: ctx}, big.NewInt(int64(jobID)))
+	details, err := c.contract.GetJobDetails(&bind.CallOpts{Context: ctx}, big.NewInt(int64(jobID)))
 	if err != nil {
 		// If error contains "job does not exist" or similar, return false
 		// Otherwise, it's a real error
@@ -325,6 +325,18 @@ func (c *Client) JobExists(ctx context.Context, jobID uint64) (bool, error) {
 		}
 		return false, err
 	}
+
+	// NEW: Check if job is corrupted (ghost job with null addresses or zero amount)
+	isCorrupted := (details.Client.Hex() == "0x0000000000000000000000000000000000000000" ||
+		details.Freelancer.Hex() == "0x0000000000000000000000000000000000000000" ||
+		details.UsdAmount.Cmp(big.NewInt(0)) == 0)
+
+	if isCorrupted {
+		log.Printf("DEBUG JobExists: Job %d exists but is CORRUPTED (null addresses or zero amount) - treating as non-existing", jobID)
+		return false, nil // Allow overwriting corrupted jobs
+	}
+
+	log.Printf("DEBUG JobExists: Job %d exists and is VALID (legitimate job)", jobID)
 	return true, nil
 }
 
