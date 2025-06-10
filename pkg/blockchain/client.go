@@ -418,3 +418,11 @@ func (c *Client) getRevertReason(ctx context.Context, txHash common.Hash) string
 	// In a production system, you'd want to replay the transaction to get the actual revert reason
 	return "execution reverted"
 }
+
+// GetContract returns the contract instance
+func (c *Client) GetContract() (*contracts.EthJobEscrow, error) {
+	if c.contract == nil {
+		return nil, fmt.Errorf("contract not initialized")
+	}
+	return c.contract, nil
+}

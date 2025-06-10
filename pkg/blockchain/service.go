@@ -9,10 +9,10 @@ import (
 	"math/big"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/fahedafzaal/go-integration/contracts"
 	"github.com/fahedafzaal/go-integration/internal/config"
 )
 
@@ -139,6 +139,7 @@ type PostJobRequest struct {
 	FreelancerAddress string `json:"freelancer_address"` // applicant wallet
 	USDAmount         string `json:"usd_amount"`         // agreed_usd_amount
 	ClientAddress     string `json:"client_address"`     // poster wallet
+	ClientTxHash      string `json:"client_tx_hash"`     // transaction hash from client's wallet
 }
 
 // TransactionResponse represents a blockchain transaction response
@@ -167,8 +168,8 @@ type JobStatusResponse struct {
 // PostJob initiates escrow funding when candidate accepts offer
 func (s *PaymentGatewayService) PostJob(ctx context.Context, req PostJobRequest) (*TransactionResponse, error) {
 	// DEBUG: Log the incoming request
-	log.Printf("DEBUG PostJob: Starting PostJob for JobID=%d, USDAmount='%s', Freelancer=%s, Client=%s",
-		req.JobID, req.USDAmount, req.FreelancerAddress, req.ClientAddress)
+	log.Printf("DEBUG PostJob: Starting PostJob for JobID=%d, USDAmount='%s', Freelancer=%s, Client=%s, ClientTxHash=%s",
+		req.JobID, req.USDAmount, req.FreelancerAddress, req.ClientAddress, req.ClientTxHash)
 
 	// For direct mode, check smart contract state first
 	if s.canUseDirect() {
@@ -191,7 +192,7 @@ func (s *PaymentGatewayService) PostJob(ctx context.Context, req PostJobRequest)
 			if status.PaymentStatus == "pending_deposit" {
 				log.Printf("INFO PostJob: Job %d exists in smart contract with pending_deposit status - returning success for database sync", req.JobID)
 				return &TransactionResponse{
-					TxHash:  "", // Empty hash indicates existing job
+					TxHash:  req.ClientTxHash, // Use client's transaction hash
 					Success: true,
 					Error:   fmt.Sprintf("job_exists_pending_deposit:%s", status.PaymentStatus),
 				}, nil
@@ -200,57 +201,61 @@ func (s *PaymentGatewayService) PostJob(ctx context.Context, req PostJobRequest)
 			// For other states, return proper error
 			return nil, fmt.Errorf("job %d already exists in smart contract with status '%s' - use CheckAndReconcileJobState() to sync database", req.JobID, status.PaymentStatus)
 		} else {
-			log.Printf("DEBUG PostJob: Job %d does not exist in smart contract, proceeding with creation", req.JobID)
+			log.Printf("DEBUG PostJob: Job %d does not exist in smart contract, proceeding with verification", req.JobID)
 		}
 	}
 
-	// Try direct blockchain interaction first (if available)
+	// Verify client's transaction
+	if req.ClientTxHash == "" {
+		return nil, fmt.Errorf("client transaction hash is required")
+	}
+
+	// Calculate required ETH amount
+	requiredEth, err := s.CalculateRequiredETH(ctx, req.USDAmount)
+	if err != nil {
+		return nil, fmt.Errorf("failed to calculate required ETH: %w", err)
+	}
+
+	log.Printf("DEBUG PostJob: Required ETH amount for job %d: %s wei", req.JobID, requiredEth.String())
+
+	// Verify the transaction
 	if s.canUseDirect() {
-		log.Printf("DEBUG PostJob: Calling postJobDirect for job %d", req.JobID)
-		result, err := s.postJobDirect(ctx, req)
+		// Verify transaction details
+		tx, isPending, err := s.client.ethClient.TransactionByHash(ctx, common.HexToHash(req.ClientTxHash))
 		if err != nil {
-			// Check if error is due to job already existing
-			if strings.Contains(err.Error(), "job already exists") || strings.Contains(err.Error(), "Job already exists") {
-				log.Printf("INFO PostJob: Job %d already exists in smart contract (detected via error)", req.JobID)
-
-				// Get job state for auto-recovery
-				status, stateErr := s.CheckAndReconcileJobState(ctx, req.JobID)
-				if stateErr == nil && status.PaymentStatus == "pending_deposit" {
-					log.Printf("INFO PostJob: Job %d already exists with pending_deposit status - returning success for database sync", req.JobID)
-					return &TransactionResponse{
-						TxHash:  "", // Empty hash indicates existing job
-						Success: true,
-						Error:   fmt.Sprintf("job_exists_pending_deposit:%s", status.PaymentStatus),
-					}, nil
-				}
-
-				// Return error for other states or if we can't determine state
-				return nil, fmt.Errorf("job %d already exists in smart contract - detected during transaction: %w", req.JobID, err)
-			}
-
-			log.Printf("ERROR PostJob: Direct blockchain call failed: %v", err)
-
-			// If we're in direct mode only, return the error
-			if s.mode == DirectMode {
-				return nil, fmt.Errorf("direct blockchain interaction failed: %w", err)
-			}
-
-			// Otherwise, fall back to HTTP
-			log.Printf("INFO PostJob: Falling back to HTTP mode")
-		} else {
-			log.Printf("DEBUG PostJob: Direct blockchain call successful for job %d", req.JobID)
-			return result, nil
+			return nil, fmt.Errorf("failed to get transaction: %w", err)
 		}
+		if isPending {
+			return nil, fmt.Errorf("transaction is still pending")
+		}
+
+		// Verify transaction sender is the client
+		from, err := s.client.ethClient.TransactionSender(ctx, tx, common.HexToHash(req.ClientTxHash), 0)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get transaction sender: %w", err)
+		}
+		if from != common.HexToAddress(req.ClientAddress) {
+			return nil, fmt.Errorf("transaction sender does not match client address")
+		}
+
+		// Verify transaction value matches required ETH
+		if tx.Value().Cmp(requiredEth) != 0 {
+			return nil, fmt.Errorf("transaction value does not match required ETH amount")
+		}
+
+		// Verify transaction is to the correct contract
+		if tx.To().Hex() != s.config.ContractAddress {
+			return nil, fmt.Errorf("transaction is not to the correct contract")
+		}
+
+		log.Printf("DEBUG PostJob: Client transaction verified successfully for job %d", req.JobID)
 	}
 
-	// Use HTTP mode
-	if s.canUseHTTP() {
-		log.Printf("DEBUG PostJob: Using HTTP mode for job %d", req.JobID)
-		return s.postJobHTTP(ctx, req)
-	}
-
-	log.Printf("ERROR PostJob: No available payment method for job %d", req.JobID)
-	return nil, fmt.Errorf("no available payment method")
+	// Return success with client's transaction hash
+	return &TransactionResponse{
+		TxHash:  req.ClientTxHash,
+		Success: true,
+	}, nil
 }
 
 // CompleteJob releases payment when poster approves work
@@ -375,48 +380,7 @@ func (s *PaymentGatewayService) canUseHTTP() bool {
 }
 
 // Direct blockchain interaction methods
-func (s *PaymentGatewayService) postJobDirect(ctx context.Context, req PostJobRequest) (*TransactionResponse, error) {
-	// DEBUG: Log the incoming request
-	log.Printf("DEBUG postJobDirect: JobID=%d, USDAmount='%s', Freelancer=%s, Client=%s",
-		req.JobID, req.USDAmount, req.FreelancerAddress, req.ClientAddress)
-
-	// Parse USD amount
-	usdAmountFloat, err := strconv.ParseFloat(req.USDAmount, 64)
-	if err != nil {
-		log.Printf("ERROR postJobDirect: Invalid USD amount '%s': %v", req.USDAmount, err)
-		return nil, fmt.Errorf("invalid USD amount: %w", err)
-	}
-
-	// Convert to wei (assuming 2 decimal places for USD)
-	usdAmountWei := big.NewInt(int64(usdAmountFloat * 100))
-
-	// DEBUG: Log the conversion
-	log.Printf("DEBUG postJobDirect: Parsed USD %.2f -> %s wei (for smart contract)", usdAmountFloat, usdAmountWei.String())
-
-	// Parse addresses
-	freelancerAddr := common.HexToAddress(req.FreelancerAddress)
-	clientAddr := common.HexToAddress(req.ClientAddress)
-
-	// DEBUG: Log parsed addresses
-	log.Printf("DEBUG postJobDirect: Freelancer address: %s, Client address: %s", freelancerAddr.Hex(), clientAddr.Hex())
-
-	// Execute blockchain transaction
-	result, err := s.client.PostJob(ctx, req.JobID, freelancerAddr, usdAmountWei, clientAddr)
-	if err != nil {
-		log.Printf("ERROR postJobDirect: Blockchain transaction failed: %v", err)
-		return nil, err
-	}
-
-	log.Printf("DEBUG postJobDirect: Blockchain transaction successful - TxHash: %s, Success: %v", result.TxHash, result.Success)
-
-	return &TransactionResponse{
-		TxHash:      result.TxHash,
-		BlockNumber: result.BlockNumber,
-		GasUsed:     result.GasUsed,
-		Success:     result.Success,
-		Error:       "",
-	}, nil
-}
+// postJobDirect is removed as we now use client transactions
 
 func (s *PaymentGatewayService) completeJobDirect(ctx context.Context, jobID uint64) (*TransactionResponse, error) {
 	result, err := s.client.MarkJobCompleted(ctx, jobID)
@@ -765,4 +729,134 @@ func (s *PaymentGatewayService) CheckAndReconcileJobState(ctx context.Context, j
 		PaymentStatus:     paymentStatus,
 		ApplicationStatus: "active",
 	}, nil
+}
+
+// CalculateRequiredETH calculates the required ETH amount for a USD amount
+func (s *PaymentGatewayService) CalculateRequiredETH(ctx context.Context, usdAmount string) (*big.Int, error) {
+	// Parse USD amount
+	usdAmountFloat, err := strconv.ParseFloat(usdAmount, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid USD amount: %w", err)
+	}
+
+	// Get current ETH price
+	ethPrice, err := s.GetETHUSDPrice(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get ETH price: %w", err)
+	}
+
+	// Convert USD to ETH
+	// Formula: (USD * 10^18) / ETH_PRICE
+	usdInWei := new(big.Int).Mul(big.NewInt(int64(usdAmountFloat*100)), big.NewInt(1e16)) // Convert to wei
+	requiredEth := new(big.Int).Div(usdInWei, ethPrice)
+
+	return requiredEth, nil
+}
+
+// GetRequiredETH returns the required ETH amount for a job
+func (s *PaymentGatewayService) GetRequiredETH(ctx context.Context, usdAmount string) (*TransactionResponse, error) {
+	// Calculate required ETH amount
+	requiredEth, err := s.CalculateRequiredETH(ctx, usdAmount)
+	if err != nil {
+		return nil, fmt.Errorf("failed to calculate required ETH: %w", err)
+	}
+
+	// Get current ETH price for reference
+	ethPrice, err := s.GetETHUSDPrice(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get ETH price: %w", err)
+	}
+
+	// Convert to float for display
+	ethPriceFloat := new(big.Float).Quo(new(big.Float).SetInt(ethPrice), new(big.Float).SetInt64(1e8))
+	ethPriceStr := ethPriceFloat.Text('f', 2)
+
+	// Return response with required ETH amount
+	return &TransactionResponse{
+		TxHash:  requiredEth.String(), // Use TxHash field to return the required ETH amount
+		Success: true,
+		Error:   fmt.Sprintf("ETH_PRICE:%s", ethPriceStr), // Include current ETH price in error field
+	}, nil
+}
+
+// GetContractInteractionData returns the data needed for the client to interact with the contract
+func (s *PaymentGatewayService) GetContractInteractionData(ctx context.Context, req PostJobRequest) (*TransactionResponse, error) {
+	// Calculate required ETH amount
+	requiredEth, err := s.CalculateRequiredETH(ctx, req.USDAmount)
+	if err != nil {
+		return nil, fmt.Errorf("failed to calculate required ETH: %w", err)
+	}
+
+	// Get current ETH price for reference
+	ethPrice, err := s.GetETHUSDPrice(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get ETH price: %w", err)
+	}
+
+	// Convert to float for display
+	ethPriceFloat := new(big.Float).Quo(new(big.Float).SetInt(ethPrice), new(big.Float).SetInt64(1e8))
+	ethPriceStr := ethPriceFloat.Text('f', 2)
+
+	// Parse addresses
+	freelancerAddr := common.HexToAddress(req.FreelancerAddress)
+	clientAddr := common.HexToAddress(req.ClientAddress)
+
+	// Parse USD amount
+	usdAmountFloat, err := strconv.ParseFloat(req.USDAmount, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid USD amount: %w", err)
+	}
+	usdAmountWei := big.NewInt(int64(usdAmountFloat * 100))
+
+	// Generate contract interaction data
+	contractData := map[string]interface{}{
+		"contract_address": s.config.ContractAddress,
+		"required_eth":     requiredEth.String(),
+		"eth_price_usd":    ethPriceStr,
+		"job_id":           req.JobID,
+		"freelancer":       freelancerAddr.Hex(),
+		"client":           clientAddr.Hex(),
+		"usd_amount":       usdAmountWei.String(),
+	}
+
+	// Convert to JSON
+	jsonData, err := json.Marshal(contractData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal contract data: %w", err)
+	}
+
+	// Return response with contract interaction data
+	return &TransactionResponse{
+		TxHash:  string(jsonData), // Use TxHash field to return the contract data
+		Success: true,
+	}, nil
+}
+
+// GetTransactionData returns the encoded transaction data for the client
+func (s *PaymentGatewayService) GetTransactionData(ctx context.Context, req PostJobRequest) (string, error) {
+	// Parse addresses
+	freelancerAddr := common.HexToAddress(req.FreelancerAddress)
+	clientAddr := common.HexToAddress(req.ClientAddress)
+
+	// Parse USD amount
+	usdAmountFloat, err := strconv.ParseFloat(req.USDAmount, 64)
+	if err != nil {
+		return "", fmt.Errorf("invalid USD amount: %w", err)
+	}
+	usdAmountWei := big.NewInt(int64(usdAmountFloat * 100))
+
+	// Get the contract ABI
+	abi, err := contracts.EthJobEscrowMetaData.GetAbi()
+	if err != nil {
+		return "", fmt.Errorf("failed to get contract ABI: %w", err)
+	}
+
+	// Encode the function call data
+	data, err := abi.Pack("postJob", big.NewInt(int64(req.JobID)), freelancerAddr, usdAmountWei, clientAddr)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode transaction data: %w", err)
+	}
+
+	// Return the hex-encoded data
+	return common.Bytes2Hex(data), nil
 }
