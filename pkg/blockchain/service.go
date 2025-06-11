@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/fahedafzaal/go-integration/contracts"
 	"github.com/fahedafzaal/go-integration/internal/config"
 )
@@ -186,34 +187,11 @@ func (s *PaymentGatewayService) PostJob(ctx context.Context, req PostJobRequest)
 
 	log.Printf("DEBUG PostJob: Required ETH amount for job %d: %s wei", req.JobID, requiredEth.String())
 
-	// Verify the transaction
+	// Verify the transaction using event-based approach
 	if s.canUseDirect() {
-		// Verify transaction details
-		tx, isPending, err := s.client.ethClient.TransactionByHash(ctx, common.HexToHash(req.ClientTxHash))
+		err := s.verifyJobPostedTransaction(ctx, req, requiredEth)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get transaction: %w", err)
-		}
-		if isPending {
-			return nil, fmt.Errorf("transaction is still pending")
-		}
-
-		// Verify transaction sender is the client
-		from, err := s.client.ethClient.TransactionSender(ctx, tx, common.HexToHash(req.ClientTxHash), 0)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get transaction sender: %w", err)
-		}
-		if from != common.HexToAddress(req.ClientAddress) {
-			return nil, fmt.Errorf("transaction sender does not match client address")
-		}
-
-		// Verify transaction value matches required ETH
-		if tx.Value().Cmp(requiredEth) != 0 {
-			return nil, fmt.Errorf("transaction value does not match required ETH amount")
-		}
-
-		// Verify transaction is to the correct contract
-		if tx.To().Hex() != s.config.ContractAddress {
-			return nil, fmt.Errorf("transaction is not to the correct contract")
+			return nil, fmt.Errorf("transaction verification failed: %w", err)
 		}
 
 		log.Printf("DEBUG PostJob: Client transaction verified successfully for job %d", req.JobID)
@@ -224,6 +202,153 @@ func (s *PaymentGatewayService) PostJob(ctx context.Context, req PostJobRequest)
 		TxHash:  req.ClientTxHash,
 		Success: true,
 	}, nil
+}
+
+// verifyJobPostedTransaction verifies the client's transaction using event-based approach
+func (s *PaymentGatewayService) verifyJobPostedTransaction(ctx context.Context, req PostJobRequest, requiredEth *big.Int) error {
+	txHash := common.HexToHash(req.ClientTxHash)
+
+	// Get transaction and receipt
+	tx, isPending, err := s.client.ethClient.TransactionByHash(ctx, txHash)
+	if err != nil {
+		return fmt.Errorf("failed to get transaction: %w", err)
+	}
+	if isPending {
+		return fmt.Errorf("transaction is still pending")
+	}
+
+	receipt, err := s.client.ethClient.TransactionReceipt(ctx, txHash)
+	if err != nil {
+		return fmt.Errorf("failed to get transaction receipt: %w", err)
+	}
+
+	// Check if transaction was successful
+	if receipt.Status != types.ReceiptStatusSuccessful {
+		return fmt.Errorf("transaction failed with status: %d", receipt.Status)
+	}
+
+	// Verify transaction sender using block hash (not tx hash)
+	from, err := s.client.ethClient.TransactionSender(ctx, tx, receipt.BlockHash, uint(receipt.TransactionIndex))
+	if err != nil {
+		return fmt.Errorf("failed to get transaction sender: %w", err)
+	}
+
+	expectedClient := common.HexToAddress(req.ClientAddress)
+	if from != expectedClient {
+		return fmt.Errorf("transaction sender %s does not match expected client address %s",
+			from.Hex(), expectedClient.Hex())
+	}
+
+	// Verify transaction is to the correct contract
+	if tx.To() == nil || tx.To().Hex() != s.config.ContractAddress {
+		return fmt.Errorf("transaction is not to the correct contract address")
+	}
+
+	// Verify transaction value with 1% tolerance
+	tolerance := new(big.Int).Div(requiredEth, big.NewInt(100)) // 1% tolerance
+	delta := new(big.Int).Sub(tx.Value(), requiredEth)
+	deltaAbs := new(big.Int).Abs(delta)
+	if deltaAbs.Cmp(tolerance) == 1 {
+		return fmt.Errorf("transaction value %s differs from required %s by more than 1%% tolerance",
+			tx.Value().String(), requiredEth.String())
+	}
+
+	log.Printf("DEBUG PostJob: Value check passed - TX: %s, Required: %s, Tolerance: %s",
+		tx.Value().String(), requiredEth.String(), tolerance.String())
+
+	// Most importantly: Verify JobPosted event was emitted
+	err = s.verifyJobPostedEvent(ctx, receipt, req)
+	if err != nil {
+		return fmt.Errorf("failed to verify JobPosted event: %w", err)
+	}
+
+	return nil
+}
+
+// verifyJobPostedEvent verifies that the JobPosted event was emitted with correct parameters
+func (s *PaymentGatewayService) verifyJobPostedEvent(ctx context.Context, receipt *types.Receipt, req PostJobRequest) error {
+	// Get the contract instance for event parsing
+	contract, err := s.client.GetContract()
+	if err != nil {
+		return fmt.Errorf("failed to get contract instance: %w", err)
+	}
+
+	// Parse expected values
+	expectedJobID := big.NewInt(int64(req.JobID))
+	expectedClient := common.HexToAddress(req.ClientAddress)
+	expectedFreelancer := common.HexToAddress(req.FreelancerAddress)
+
+	usdAmountFloat, err := strconv.ParseFloat(req.USDAmount, 64)
+	if err != nil {
+		return fmt.Errorf("invalid USD amount: %w", err)
+	}
+	val := new(big.Float).Mul(big.NewFloat(usdAmountFloat), big.NewFloat(1e8))
+	expectedUSDAmount, _ := val.Int(nil)
+
+	// Look for JobPosted event in transaction logs
+	var foundEvent *contracts.EthJobEscrowJobPosted
+	for _, log := range receipt.Logs {
+		// Check if this log is from our contract
+		if log.Address != common.HexToAddress(s.config.ContractAddress) {
+			continue
+		}
+
+		// Try to parse as JobPosted event
+		event, err := contract.ParseJobPosted(*log)
+		if err != nil {
+			// This log is not a JobPosted event, continue
+			continue
+		}
+
+		// Check if this is the event for our job
+		if event.JobId.Cmp(expectedJobID) == 0 {
+			foundEvent = event
+			break
+		}
+	}
+
+	if foundEvent == nil {
+		return fmt.Errorf("JobPosted event not found for job ID %d in transaction logs", req.JobID)
+	}
+
+	// Verify event parameters match expectations
+	if foundEvent.Client != expectedClient {
+		return fmt.Errorf("event client address %s does not match expected %s",
+			foundEvent.Client.Hex(), expectedClient.Hex())
+	}
+
+	if foundEvent.Freelancer != expectedFreelancer {
+		return fmt.Errorf("event freelancer address %s does not match expected %s",
+			foundEvent.Freelancer.Hex(), expectedFreelancer.Hex())
+	}
+
+	if foundEvent.UsdAmount.Cmp(expectedUSDAmount) != 0 {
+		return fmt.Errorf("event USD amount %s does not match expected %s",
+			foundEvent.UsdAmount.String(), expectedUSDAmount.String())
+	}
+
+	// Verify the ETH amount is reasonable (within our tolerance)
+	requiredEth, err := s.CalculateRequiredETH(ctx, req.USDAmount)
+	if err != nil {
+		return fmt.Errorf("failed to recalculate required ETH: %w", err)
+	}
+
+	tolerance := new(big.Int).Div(requiredEth, big.NewInt(100)) // 1% tolerance
+	ethDelta := new(big.Int).Sub(foundEvent.EthAmount, requiredEth)
+	ethDeltaAbs := new(big.Int).Abs(ethDelta)
+	if ethDeltaAbs.Cmp(tolerance) == 1 {
+		return fmt.Errorf("event ETH amount %s differs from expected %s by more than 1%% tolerance",
+			foundEvent.EthAmount.String(), requiredEth.String())
+	}
+
+	log.Printf("DEBUG PostJob: JobPosted event verified successfully")
+	log.Printf("  - JobID: %s", foundEvent.JobId.String())
+	log.Printf("  - Client: %s", foundEvent.Client.Hex())
+	log.Printf("  - Freelancer: %s", foundEvent.Freelancer.Hex())
+	log.Printf("  - USD Amount: %s", foundEvent.UsdAmount.String())
+	log.Printf("  - ETH Amount: %s", foundEvent.EthAmount.String())
+
+	return nil
 }
 
 // CompleteJob releases payment when poster approves work
@@ -386,9 +511,8 @@ func (s *PaymentGatewayService) getJobStatusDirect(ctx context.Context, jobID ui
 		return nil, err
 	}
 
-	// Convert amounts back to strings
-	usdAmountFloat := float64(details.USDAmount.Int64()) / 100.0
-	usdAmountStr := fmt.Sprintf("%.2f", usdAmountFloat)
+	// Convert amounts back to strings using fromUsdE8
+	usdAmountStr := fromUsdE8(details.USDAmount)
 
 	// Determine payment status
 	paymentStatus := "pending"
@@ -669,9 +793,8 @@ func (s *PaymentGatewayService) CheckAndReconcileJobState(ctx context.Context, j
 		}, nil
 	}
 
-	// Convert amounts back to strings
-	usdAmountFloat := float64(details.USDAmount.Int64()) / 100.0
-	usdAmountStr := fmt.Sprintf("%.2f", usdAmountFloat)
+	// Convert amounts back to strings using fromUsdE8
+	usdAmountStr := fromUsdE8(details.USDAmount)
 
 	// Determine payment status based on smart contract state
 	paymentStatus := "pending_deposit"
@@ -701,26 +824,34 @@ func (s *PaymentGatewayService) CheckAndReconcileJobState(ctx context.Context, j
 	}, nil
 }
 
+// fromUsdE8 converts 8-decimal "micro-dollars" back to human-readable USD string
+func fromUsdE8(u *big.Int) string {
+	f := new(big.Float).Quo(new(big.Float).SetInt(u), big.NewFloat(1e8))
+	return f.Text('f', 2) // "1234.56"
+}
+
 // CalculateRequiredETH calculates the required ETH amount for a USD amount
-func (s *PaymentGatewayService) CalculateRequiredETH(ctx context.Context, usdAmount string) (*big.Int, error) {
-	// Parse USD amount
-	usdAmountFloat, err := strconv.ParseFloat(usdAmount, 64)
+func (s *PaymentGatewayService) CalculateRequiredETH(ctx context.Context, usd string) (*big.Int, error) {
+	usdFloat, err := strconv.ParseFloat(usd, 64)
 	if err != nil {
 		return nil, fmt.Errorf("invalid USD amount: %w", err)
 	}
 
-	// Get current ETH price
-	ethPrice, err := s.GetETHUSDPrice(ctx)
+	val := new(big.Float).Mul(big.NewFloat(usdFloat), big.NewFloat(1e8))
+	usdE8, _ := val.Int(nil)
+
+	price, err := s.GetETHUSDPrice(ctx) // 8-decimals
 	if err != nil {
 		return nil, fmt.Errorf("failed to get ETH price: %w", err)
 	}
 
-	// Convert USD to ETH
-	// Formula: (USD * 10^18) / ETH_PRICE
-	usdInWei := new(big.Int).Mul(big.NewInt(int64(usdAmountFloat*100)), big.NewInt(1e16)) // Convert to wei
-	requiredEth := new(big.Int).Div(usdInWei, ethPrice)
+	wei := new(big.Int).Mul(usdE8, big.NewInt(1e18))
+	wei.Div(wei, price)
 
-	return requiredEth, nil
+	log.Printf("DEBUG CalculateRequiredETH: USD=%.2f, USDe8=%s, ETHPrice=%s, RequiredWei=%s",
+		usdFloat, usdE8.String(), price.String(), wei.String())
+
+	return wei, nil
 }
 
 // GetRequiredETH returns the required ETH amount for a job
@@ -776,7 +907,8 @@ func (s *PaymentGatewayService) GetContractInteractionData(ctx context.Context, 
 	if err != nil {
 		return nil, fmt.Errorf("invalid USD amount: %w", err)
 	}
-	usdAmountWei := big.NewInt(int64(usdAmountFloat * 100))
+	val := new(big.Float).Mul(big.NewFloat(usdAmountFloat), big.NewFloat(1e8))
+	usdE8, _ := val.Int(nil)
 
 	// Generate contract interaction data
 	contractData := map[string]interface{}{
@@ -786,7 +918,7 @@ func (s *PaymentGatewayService) GetContractInteractionData(ctx context.Context, 
 		"job_id":           req.JobID,
 		"freelancer":       freelancerAddr.Hex(),
 		"client":           clientAddr.Hex(),
-		"usd_amount":       usdAmountWei.String(),
+		"usd_amount":       usdE8.String(),
 	}
 
 	// Convert to JSON
@@ -813,7 +945,8 @@ func (s *PaymentGatewayService) GetTransactionData(ctx context.Context, req Post
 	if err != nil {
 		return "", fmt.Errorf("invalid USD amount: %w", err)
 	}
-	usdAmountWei := big.NewInt(int64(usdAmountFloat * 100))
+	val := new(big.Float).Mul(big.NewFloat(usdAmountFloat), big.NewFloat(1e8))
+	usdE8, _ := val.Int(nil)
 
 	// Get the contract ABI
 	abi, err := contracts.EthJobEscrowMetaData.GetAbi()
@@ -822,7 +955,7 @@ func (s *PaymentGatewayService) GetTransactionData(ctx context.Context, req Post
 	}
 
 	// Encode the function call data
-	data, err := abi.Pack("postJob", big.NewInt(int64(req.JobID)), freelancerAddr, usdAmountWei, clientAddr)
+	data, err := abi.Pack("postJob", big.NewInt(int64(req.JobID)), freelancerAddr, usdE8, clientAddr)
 	if err != nil {
 		return "", fmt.Errorf("failed to encode transaction data: %w", err)
 	}

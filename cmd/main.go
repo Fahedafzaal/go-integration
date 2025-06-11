@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/big"
 	"net/http"
 	"strconv"
 	"time"
@@ -139,14 +138,14 @@ func (pg *PaymentGateway) postJobHandler(w http.ResponseWriter, r *http.Request)
 	// Parse addresses and amount
 	freelancerAddr := common.HexToAddress(req.FreelancerAddress)
 	clientAddr := common.HexToAddress(req.ClientAddress)
-	usdAmount, ok := new(big.Int).SetString(req.USDAmount, 10)
-	if !ok {
+	usdAmountFloat, err := strconv.ParseFloat(req.USDAmount, 64)
+	if err != nil {
 		http.Error(w, "Invalid USD amount", http.StatusBadRequest)
 		return
 	}
 
 	// Post job to blockchain - let smart contract handle all validation
-	result, err := pg.client.PostJob(ctx, req.JobID, freelancerAddr, usdAmount, clientAddr)
+	result, err := pg.client.PostJob(ctx, req.JobID, freelancerAddr, usdAmountFloat, clientAddr)
 	if err != nil {
 		// Smart contract rejected the transaction with a clear reason
 		log.Printf("Smart contract rejected job %d: %v", req.JobID, err)
