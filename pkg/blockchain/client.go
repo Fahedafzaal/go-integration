@@ -115,17 +115,7 @@ func (c *Client) GetAuth(ctx context.Context) (*bind.TransactOpts, error) {
 
 // PostJob creates a new job on the blockchain
 func (c *Client) PostJob(ctx context.Context, jobID uint64, freelancer common.Address, usdAmount *big.Int, client common.Address) (*TransactionResult, error) {
-	// Check if job already exists in smart contract
-	exists, err := c.JobExists(ctx, jobID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to check if job exists: %w", err)
-	}
-	if exists {
-		log.Printf("Job %d already exists in smart contract", jobID)
-
-		// Return an error instead of success to maintain clear semantics
-		return nil, fmt.Errorf("job %d already exists in smart contract", jobID)
-	}
+	// Let the smart contract be the single source of truth - no pre-validation needed
 
 	// DEBUG: Log the USD amount being converted
 	log.Printf("DEBUG PostJob: Converting USD amount %s to ETH for job %d", usdAmount.String(), jobID)
@@ -326,9 +316,11 @@ func (c *Client) JobExists(ctx context.Context, jobID uint64) (bool, error) {
 		return false, err
 	}
 
-	// NEW: Check if job is corrupted (ghost job with null addresses or zero amount)
-	isCorrupted := (details.Client.Hex() == "0x0000000000000000000000000000000000000000" ||
-		details.Freelancer.Hex() == "0x0000000000000000000000000000000000000000" ||
+	// NEW: Check if job is corrupted (ghost job with ALL fields being zero/null)
+	// This aligns with smart contract requirement: jobs[jobId].client == address(0)
+	zeroAddr := "0x0000000000000000000000000000000000000000"
+	isCorrupted := (details.Client.Hex() == zeroAddr &&
+		details.Freelancer.Hex() == zeroAddr &&
 		details.UsdAmount.Cmp(big.NewInt(0)) == 0)
 
 	if isCorrupted {

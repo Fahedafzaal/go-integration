@@ -171,42 +171,7 @@ func (s *PaymentGatewayService) PostJob(ctx context.Context, req PostJobRequest)
 	log.Printf("DEBUG PostJob: Starting PostJob for JobID=%d, USDAmount='%s', Freelancer=%s, Client=%s, ClientTxHash=%s",
 		req.JobID, req.USDAmount, req.FreelancerAddress, req.ClientAddress, req.ClientTxHash)
 
-	// For direct mode, check smart contract state first
-	if s.canUseDirect() {
-		log.Printf("DEBUG PostJob: Using direct mode, checking smart contract state for job %d", req.JobID)
-
-		// Check if job already exists in smart contract
-		exists, err := s.client.JobExists(ctx, req.JobID)
-		if err != nil {
-			log.Printf("WARNING PostJob: Could not check smart contract state: %v", err)
-		} else if exists {
-			log.Printf("INFO PostJob: Job %d already exists in smart contract", req.JobID)
-
-			// Get job state for proper error reporting and auto-recovery
-			status, err := s.CheckAndReconcileJobState(ctx, req.JobID)
-			if err != nil {
-				return nil, fmt.Errorf("job %d already exists in smart contract, but failed to get state: %w", req.JobID, err)
-			}
-
-			// For corrupted jobs (treated as "not_found"), allow proceeding with verification
-			if status.PaymentStatus == "not_found" {
-				log.Printf("INFO PostJob: Job %d is corrupted on smart contract - allowing overwrite", req.JobID)
-				// Continue to transaction verification below
-			} else if status.PaymentStatus == "pending_deposit" {
-				log.Printf("INFO PostJob: Job %d exists in smart contract with pending_deposit status - returning success for database sync", req.JobID)
-				return &TransactionResponse{
-					TxHash:  req.ClientTxHash, // Use client's transaction hash
-					Success: true,
-					Error:   fmt.Sprintf("job_exists_pending_deposit:%s", status.PaymentStatus),
-				}, nil
-			} else {
-				// For other states, return proper error
-				return nil, fmt.Errorf("job %d already exists in smart contract with status '%s' - use CheckAndReconcileJobState() to sync database", req.JobID, status.PaymentStatus)
-			}
-		} else {
-			log.Printf("DEBUG PostJob: Job %d does not exist in smart contract, proceeding with verification", req.JobID)
-		}
-	}
+	// Let the smart contract be the single source of truth for job existence validation
 
 	// Verify client's transaction
 	if req.ClientTxHash == "" {
@@ -688,8 +653,10 @@ func (s *PaymentGatewayService) CheckAndReconcileJobState(ctx context.Context, j
 	log.Printf("  - IsPaid: %v", details.IsPaid)
 
 	// NEW: Detect corrupted/ghost jobs and treat them as "not found"
-	isCorrupted := (details.Client.Hex() == "0x0000000000000000000000000000000000000000" ||
-		details.Freelancer.Hex() == "0x0000000000000000000000000000000000000000" ||
+	// This aligns with smart contract requirement: jobs[jobId].client == address(0)
+	zeroAddr := "0x0000000000000000000000000000000000000000"
+	isCorrupted := (details.Client.Hex() == zeroAddr &&
+		details.Freelancer.Hex() == zeroAddr &&
 		details.USDAmount.Cmp(big.NewInt(0)) == 0)
 
 	if isCorrupted {

@@ -8,7 +8,6 @@ import (
 	"math/big"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -146,37 +145,12 @@ func (pg *PaymentGateway) postJobHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Post job to blockchain
+	// Post job to blockchain - let smart contract handle all validation
 	result, err := pg.client.PostJob(ctx, req.JobID, freelancerAddr, usdAmount, clientAddr)
 	if err != nil {
-		// Check if the error is due to job already existing
-		if strings.Contains(err.Error(), "job already exists") || strings.Contains(err.Error(), "Job already exists") {
-			log.Printf("Job %d already exists in smart contract, attempting database reconciliation", req.JobID)
-
-			// Try to reconcile database state with smart contract
-			// Use a dummy transaction hash since we don't have access to the original one
-			reconcileTxHash := "existing_on_blockchain"
-
-			// Update database to reflect that deposit was initiated
-			if updateErr := pg.db.UpdatePaymentStatus(ctx, applicationID, "deposited", &reconcileTxHash, "deposit"); updateErr != nil {
-				log.Printf("Warning: Failed to reconcile database state: %v", updateErr)
-			}
-
-			// Return success response
-			response := TransactionResponse{
-				TxHash:      reconcileTxHash,
-				BlockNumber: 0,
-				GasUsed:     0,
-				Success:     true,
-				Error:       "Job already exists on blockchain",
-			}
-
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(response)
-			return
-		}
-
-		http.Error(w, fmt.Sprintf("Failed to post job to blockchain: %v", err), http.StatusInternalServerError)
+		// Smart contract rejected the transaction with a clear reason
+		log.Printf("Smart contract rejected job %d: %v", req.JobID, err)
+		http.Error(w, fmt.Sprintf("Smart contract rejected transaction: %v", err), http.StatusBadRequest)
 		return
 	}
 
