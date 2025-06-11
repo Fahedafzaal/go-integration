@@ -188,18 +188,21 @@ func (s *PaymentGatewayService) PostJob(ctx context.Context, req PostJobRequest)
 				return nil, fmt.Errorf("job %d already exists in smart contract, but failed to get state: %w", req.JobID, err)
 			}
 
-			// For pending_deposit state, return a success response with empty hash to trigger database sync
-			if status.PaymentStatus == "pending_deposit" {
+			// For corrupted jobs (treated as "not_found"), allow proceeding with verification
+			if status.PaymentStatus == "not_found" {
+				log.Printf("INFO PostJob: Job %d is corrupted on smart contract - allowing overwrite", req.JobID)
+				// Continue to transaction verification below
+			} else if status.PaymentStatus == "pending_deposit" {
 				log.Printf("INFO PostJob: Job %d exists in smart contract with pending_deposit status - returning success for database sync", req.JobID)
 				return &TransactionResponse{
 					TxHash:  req.ClientTxHash, // Use client's transaction hash
 					Success: true,
 					Error:   fmt.Sprintf("job_exists_pending_deposit:%s", status.PaymentStatus),
 				}, nil
+			} else {
+				// For other states, return proper error
+				return nil, fmt.Errorf("job %d already exists in smart contract with status '%s' - use CheckAndReconcileJobState() to sync database", req.JobID, status.PaymentStatus)
 			}
-
-			// For other states, return proper error
-			return nil, fmt.Errorf("job %d already exists in smart contract with status '%s' - use CheckAndReconcileJobState() to sync database", req.JobID, status.PaymentStatus)
 		} else {
 			log.Printf("DEBUG PostJob: Job %d does not exist in smart contract, proceeding with verification", req.JobID)
 		}

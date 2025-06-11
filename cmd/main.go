@@ -208,6 +208,83 @@ func (pg *PaymentGateway) postJobHandler(w http.ResponseWriter, r *http.Request)
 	json.NewEncoder(w).Encode(response)
 }
 
+// GET /get-transaction-data?job_id=X&freelancer_address=Y&usd_amount=Z&client_address=W
+// Returns encoded transaction data for smart contract interaction
+func (pg *PaymentGateway) getTransactionDataHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse query parameters
+	jobIDStr := r.URL.Query().Get("job_id")
+	freelancerAddress := r.URL.Query().Get("freelancer_address")
+	usdAmount := r.URL.Query().Get("usd_amount")
+	clientAddress := r.URL.Query().Get("client_address")
+
+	if jobIDStr == "" || freelancerAddress == "" || usdAmount == "" || clientAddress == "" {
+		http.Error(w, "Missing required parameters: job_id, freelancer_address, usd_amount, client_address", http.StatusBadRequest)
+		return
+	}
+
+	jobID, err := strconv.ParseUint(jobIDStr, 10, 64)
+	if err != nil {
+		http.Error(w, "Invalid job_id", http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Create a payment service with direct mode
+	service, err := blockchain.NewPaymentGatewayServiceDirect(
+		pg.config.EthereumRPCURL,
+		pg.config.ContractAddress,
+		pg.config.PrivateKey,
+	)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create payment service: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer service.Close()
+
+	// Calculate required ETH amount
+	requiredEth, err := service.CalculateRequiredETH(ctx, usdAmount)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to calculate required ETH: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Get encoded transaction data
+	req := blockchain.PostJobRequest{
+		JobID:             jobID,
+		FreelancerAddress: freelancerAddress,
+		USDAmount:         usdAmount,
+		ClientAddress:     clientAddress,
+	}
+
+	transactionData, err := service.GetTransactionData(ctx, req)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get transaction data: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Return transaction data for client to use
+	response := map[string]interface{}{
+		"contract_address": pg.config.ContractAddress,
+		"required_eth":     requiredEth.String(),
+		"transaction_data": "0x" + transactionData,
+		"job_id":           jobID,
+		"freelancer":       freelancerAddress,
+		"client":           clientAddress,
+		"usd_amount":       usdAmount,
+		"instructions":     "Send a transaction to contract_address with value=required_eth and data=transaction_data",
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
 // POST /complete-job?job_id=X - Called when poster approves work
 func (pg *PaymentGateway) completeJobHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -483,13 +560,14 @@ func main() {
 	defer gateway.db.Close()
 
 	// Setup HTTP routes for your application flow
-	http.HandleFunc("/post-job", gateway.postJobHandler)               // Offer accepted → fund escrow
-	http.HandleFunc("/complete-job", gateway.completeJobHandler)       // Work approved → release payment
-	http.HandleFunc("/cancel-job", gateway.cancelJobHandler)           // Cancel/refund
-	http.HandleFunc("/job-status", gateway.getJobStatusHandler)        // Get payment status
-	http.HandleFunc("/confirm-deposit", gateway.confirmDepositHandler) // Confirm deposit completion
-	http.HandleFunc("/confirm-release", gateway.confirmReleaseHandler) // Confirm release completion
-	http.HandleFunc("/eth-price", gateway.getEthPriceHandler)          // Current ETH price
+	http.HandleFunc("/post-job", gateway.postJobHandler)                        // Offer accepted → fund escrow
+	http.HandleFunc("/complete-job", gateway.completeJobHandler)                // Work approved → release payment
+	http.HandleFunc("/cancel-job", gateway.cancelJobHandler)                    // Cancel/refund
+	http.HandleFunc("/job-status", gateway.getJobStatusHandler)                 // Get payment status
+	http.HandleFunc("/get-transaction-data", gateway.getTransactionDataHandler) // Get encoded transaction data
+	http.HandleFunc("/confirm-deposit", gateway.confirmDepositHandler)          // Confirm deposit completion
+	http.HandleFunc("/confirm-release", gateway.confirmReleaseHandler)          // Confirm release completion
+	http.HandleFunc("/eth-price", gateway.getEthPriceHandler)                   // Current ETH price
 
 	// Health check endpoint
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
